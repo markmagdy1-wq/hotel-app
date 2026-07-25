@@ -2608,19 +2608,6 @@ function SystemLoginGate() {
           <button onClick={submit} disabled={checking} style={{ ...primaryBtn, width: "100%" }}>
             {checking ? "Signing in…" : "Sign in"}
           </button>
-
-          { /*<div style={{ marginTop: 14, paddingTop: 14, borderTop: `1px solid ${TOKENS.paperDim}` }}>
-            <button
-              onClick={testConnection}
-              disabled={connTest.status === "testing"}
-              style={{ ...ghostBtn, width: "100%", fontSize: "0.75rem" }}
-            >
-              {connTest.status === "testing" ? "Testing…" : "Test database connection"}
-            </button>
-            {connTest.status === "ok" && (
-              <div style={{ fontSize: "0.75rem", color: TOKENS.clean, background: TOKENS.cleanBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginTop: 8 }}>
-                {connTest.message}
-              </div>*/}
             )}
             {connTest.status === "error" && (
               <div style={{ fontSize: "0.75rem", color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginTop: 8 }}>
