@@ -95,6 +95,93 @@ async function supabaseRest(path, { accessToken, method = "GET", body, headers =
   return res.json();
 }
 
+// How many rows we pull eagerly at login for the tables that only ever grow
+// (one row per ticket / maintenance entry, forever). Reception's "recent
+// tickets" list and the room-activity view only need a recent slice on first
+// paint — everything older is fetched on demand, paginated, by the tab that
+// actually needs it (see fetchTicketsPage below).
+const INITIAL_TICKETS_LIMIT = 50;
+const INITIAL_MAINTENANCE_LIMIT = 100;
+const TICKETS_PAGE_SIZE = 10;
+
+// True offset-based pagination against PostgREST (Supabase's REST layer).
+// PostgREST returns the total row count in the Content-Range header when we
+// ask for it via `Prefer: count=exact`, which is what lets us show
+// "Page X of Y" / disable the Next button without a second round trip.
+async function fetchTicketsPage({ accessToken, hotelId, rangeStart, rangeEndExclusive, page = 0, pageSize = TICKETS_PAGE_SIZE }) {
+  const offset = page * pageSize;
+  const res = await fetch(
+    `${SUPABASE_URL}/rest/v1/tickets?hotel_id=eq.${hotelId}&ticket_date=gte.${rangeStart}&ticket_date=lt.${rangeEndExclusive}` +
+      `&order=ticket_date.desc&limit=${pageSize}&offset=${offset}`,
+    {
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${accessToken || SUPABASE_ANON_KEY}`,
+        Prefer: "count=exact",
+      },
+    }
+  );
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Supabase error ${res.status}: ${errText}`);
+  }
+  const rows = await res.json();
+  // Content-Range looks like "0-9/137" — the part after "/" is the total count.
+  const contentRange = res.headers.get("content-range") || "";
+  const total = Number(contentRange.split("/")[1]) || rows.length;
+  return { rows: rows.map(mapTicketFromDb), total, page, pageSize };
+}
+
+// Lightweight aggregate for the "Tickets sold / Persons / Revenue" summary
+// cards. We only ask Postgres for the two numeric columns we need to sum, for
+// tickets *inside the selected range* — not the whole table, and not the
+// full ticket rows. This keeps the totals accurate across the whole range
+// even though the list below it is paginated 10-at-a-time.
+async function fetchTicketsRangeTotals({ accessToken, hotelId, rangeStart, rangeEndExclusive }) {
+  const rows = await supabaseRest(
+    `tickets?hotel_id=eq.${hotelId}&ticket_date=gte.${rangeStart}&ticket_date=lt.${rangeEndExclusive}&select=persons,amount_paid`,
+    { accessToken }
+  );
+  return (rows || []).reduce(
+    (acc, r) => ({ count: acc.count + 1, persons: acc.persons + (r.persons || 0), revenue: acc.revenue + Number(r.amount_paid || 0) }),
+    { count: 0, persons: 0, revenue: 0 }
+  );
+}
+
+// Bookings that overlap a date window, fetched straight from Supabase instead
+// of filtered out of the full (unbounded, ever-growing) bookings array. Two
+// bookings "overlap" [rangeStart, rangeEndExclusive) when the booking starts
+// before the window ends AND ends after the window starts — the standard
+// interval-overlap test — which PostgREST expresses as two chained filters.
+// This is what keeps Analytics's workload bounded by "how much happened in
+// the selected range" instead of "how many bookings the hotel has ever had".
+async function fetchBookingsOverlappingRange({ accessToken, hotelId, rangeStart, rangeEndExclusive, roomNumberById }) {
+  const rows = await supabaseRest(
+    `bookings?hotel_id=eq.${hotelId}&check_in=lt.${rangeEndExclusive}&check_out=gt.${rangeStart}&order=check_in`,
+    { accessToken }
+  );
+  return (rows || []).map((b) => mapBookingFromDb(b, roomNumberById));
+}
+
+// Rooms checking in or checking out on one exact date, for the Today Report's
+// "select a day" view. Two narrow equality filters (check_in=eq.<date> /
+// check_out=eq.<date>) instead of scanning the whole bookings history — the
+// query cost stays flat no matter how long the hotel has been operating.
+async function fetchCheckInsOnDate({ accessToken, hotelId, date, roomNumberById }) {
+  const rows = await supabaseRest(
+    `bookings?hotel_id=eq.${hotelId}&check_in=eq.${date}&status=neq.cancelled&order=room_id`,
+    { accessToken }
+  );
+  return (rows || []).map((b) => mapBookingFromDb(b, roomNumberById));
+}
+async function fetchCheckOutsOnDate({ accessToken, hotelId, date, roomNumberById }) {
+  const rows = await supabaseRest(
+    `bookings?hotel_id=eq.${hotelId}&check_out=eq.${date}&status=neq.cancelled&order=room_id`,
+    { accessToken }
+  );
+  return (rows || []).map((b) => mapBookingFromDb(b, roomNumberById));
+}
+
 async function supabaseFunctionCall(fnName, accessToken, payload) {
   const res = await fetch(`${SUPABASE_URL}/functions/v1/${fnName}`, {
     method: "POST",
@@ -280,7 +367,7 @@ function monthLabel(year, month) {
 
 const WEEKDAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
 
-function MonthCalendar({ year, month, onMonthChange, highlightedDates, todayIso, onDayClick, selectedDate, legendLabel, rangeStart, rangeEnd }) {
+function MonthCalendar({ year, month, onMonthChange, highlightedDates, todayIso, onDayClick, selectedDate, legendLabel, rangeStart, rangeEnd, showLegend = true }) {
   const pad = (n) => String(n).padStart(2, "0");
   const isoFor = (d) => `${year}-${pad(month + 1)}-${pad(d)}`;
   const numDays = new Date(year, month + 1, 0).getDate();
@@ -389,7 +476,7 @@ function MonthCalendar({ year, month, onMonthChange, highlightedDates, todayIso,
         })}
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginTop: 12, paddingTop: 10, borderTop: `1px solid ${TOKENS.paperDim}`, fontSize: "0.68rem", color: TOKENS.inkSoft }}>
-        {(rangeStart !== undefined || rangeEnd !== undefined) ? (
+        {!showLegend ? null : (rangeStart !== undefined || rangeEnd !== undefined) ? (
           <>
             <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
               <span style={{ width: 10, height: 10, borderRadius: "50%", background: TOKENS.reserved, display: "inline-block" }} />
@@ -495,7 +582,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
   const [mealPlanRates, setMealPlanRates] = useState(MEAL_PLAN_RATES);
   const [extraUsers, setExtraUsers] = useState([]);
   const [tab, setTab] = useState("rooms");
-  const [managerTab, setManagerTab] = useState("analytics");
+  const [managerTab, setManagerTab] = useState("home");
   const [selectedRoom, setSelectedRoom] = useState(null);
   const [showNewBooking, setShowNewBooking] = useState(false);
   const [showNewGuest, setShowNewGuest] = useState(false);
@@ -520,8 +607,12 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             supabaseRest(`rooms?hotel_id=eq.${hid}&order=number`, { accessToken: token }),
             supabaseRest(`guests?hotel_id=eq.${hid}&order=name`, { accessToken: token }),
             supabaseRest(`bookings?hotel_id=eq.${hid}&order=check_in`, { accessToken: token }),
-            supabaseRest(`tickets?hotel_id=eq.${hid}&order=ticket_date.desc`, { accessToken: token }),
-            supabaseRest(`maintenance_log?hotel_id=eq.${hid}`, { accessToken: token }),
+            // Bounded on purpose: the manager/reception tabs only ever show a handful of
+            // recent tickets on first paint (see TicketsTab). Historical ranges beyond this
+            // window are fetched on demand by TicketRecordsTab/AnalyticsDashboard instead of
+            // pulling the entire, ever-growing tickets table on every login.
+            supabaseRest(`tickets?hotel_id=eq.${hid}&order=ticket_date.desc&limit=${INITIAL_TICKETS_LIMIT}`, { accessToken: token }),
+            supabaseRest(`maintenance_log?hotel_id=eq.${hid}&order=logged_date.desc&limit=${INITIAL_MAINTENANCE_LIMIT}`, { accessToken: token }),
             supabaseRest(`room_rates?hotel_id=eq.${hid}`, { accessToken: token }),
             supabaseRest(`meal_plan_rates?hotel_id=eq.${hid}`, { accessToken: token }),
           ]);
@@ -1159,7 +1250,10 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             gap: "0.75rem",
           }}
         >
-          <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem" }}>
+          <div
+            onClick={() => setManagerTab("home")}
+            style={{ display: "flex", alignItems: "baseline", gap: "0.75rem", cursor: "pointer" }}
+          >
             <span style={{ fontFamily: "Fraunces, serif", fontSize: "1.5rem", fontWeight: 600, letterSpacing: "0.01em" }}>
               Geisum Hotel
             </span>
@@ -1228,6 +1322,18 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         )}
 
         <main style={{ padding: "1.5rem", maxWidth: 1100, margin: "0 auto" }}>
+          {managerTab === "home" && (
+            <TabHomeScreen
+              tabs={[
+                { id: "analytics", label: "Analytics" },
+                { id: "roomActivity", label: "Room activity" },
+                { id: "ticketRecords", label: "Ticket records" },
+                { id: "todayReport", label: "Today report" },
+                { id: "pricing", label: "Room pricing" },
+              ]}
+              onSelect={setManagerTab}
+            />
+          )}
           {managerTab === "analytics" && (
             <AnalyticsDashboard
               rooms={rooms}
@@ -1236,6 +1342,8 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
               roomRates={roomRates}
               mealPlanRates={mealPlanRates}
               tickets={tickets}
+              accessToken={supabaseSession?.access_token}
+              hotelId={supabaseSession?.hotelId}
               onDeleteTicket={deleteTicket}
               guestName={guestName}
               onDeleteBooking={deleteBookingRecord}
@@ -1251,10 +1359,15 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             />
           )}
           {managerTab === "ticketRecords" && (
-            <TicketRecordsTab tickets={tickets} onDeleteTicket={deleteTicket} />
+            <TicketRecordsTab
+              accessToken={supabaseSession?.access_token}
+              hotelId={supabaseSession?.hotelId}
+              localTickets={tickets}
+              onDeleteTicket={deleteTicket}
+            />
           )}
           {managerTab === "todayReport" && (
-            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} />
+            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} />
           )}
           {managerTab === "pricing" && (
             <RoomPricingTab
@@ -1291,7 +1404,10 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             gap: "0.75rem",
           }}
         >
-          <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem" }}>
+          <div
+            onClick={() => setManagerTab("home")}
+            style={{ display: "flex", alignItems: "baseline", gap: "0.75rem", cursor: "pointer" }}
+          >
             <span style={{ fontFamily: "Fraunces, serif", fontSize: "1.5rem", fontWeight: 600, letterSpacing: "0.01em" }}>
               Geisum Hotel
             </span>
@@ -1360,6 +1476,18 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         )}
 
         <main style={{ padding: "1.5rem", maxWidth: 1100, margin: "0 auto" }}>
+          {managerTab === "home" && (
+            <TabHomeScreen
+              tabs={[
+                { id: "analytics", label: "Analytics" },
+                { id: "roomActivity", label: "Room activity" },
+                { id: "ticketRecords", label: "Ticket records" },
+                { id: "todayReport", label: "Today report" },
+                { id: "pricing", label: "Room pricing" },
+              ]}
+              onSelect={setManagerTab}
+            />
+          )}
           {managerTab === "analytics" && (
             <AnalyticsDashboard
               rooms={rooms}
@@ -1368,6 +1496,8 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
               roomRates={roomRates}
               mealPlanRates={mealPlanRates}
               tickets={tickets}
+              accessToken={supabaseSession?.access_token}
+              hotelId={supabaseSession?.hotelId}
               guestName={guestName}
             />
           )}
@@ -1380,9 +1510,15 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
               mealPlanRates={mealPlanRates}
             />
           )}
-          {managerTab === "ticketRecords" && <TicketRecordsTab tickets={tickets} />}
+          {managerTab === "ticketRecords" && (
+            <TicketRecordsTab
+              accessToken={supabaseSession?.access_token}
+              hotelId={supabaseSession?.hotelId}
+              localTickets={tickets}
+            />
+          )}
           {managerTab === "todayReport" && (
-            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} />
+            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} />
           )}
           {managerTab === "pricing" && (
             <RoomPricingTab
@@ -1587,7 +1723,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         )}
         {tab === "tickets" && <TicketsTab tickets={tickets} onAddTicket={addTicket} />}
         {tab === "todayReport" && (
-          <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} />
+          <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} />
         )}
       </main>
 
@@ -3105,40 +3241,67 @@ const ROOM_FILTERS = [
   { key: "revenue", label: "Revenue" },
 ];
 
-function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRates, mealPlanRates, tickets, onDeleteTicket, guestName, onDeleteBooking }) {
+function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRates, mealPlanRates, tickets, accessToken, hotelId, onDeleteTicket, guestName, onDeleteBooking }) {
   const [rangeStart, setRangeStart] = useState(startOfMonthISO());
   const [rangeEnd, setRangeEnd] = useState(todayISO());
-  const [calYear, setCalYear] = useState(() => Number(todayISO().slice(0, 4)));
-  const [calMonth, setCalMonth] = useState(() => Number(todayISO().slice(5, 7)) - 1);
-
-  const reservedDates = useMemo(() => {
-    const set = new Set();
-    bookings
-      .filter((b) => b.status === "reserved" || b.status === "checked_in")
-      .forEach((b) => {
-        let d = b.checkIn;
-        while (d < b.checkOut) {
-          set.add(d);
-          d = addDaysISO(d, 1);
-        }
-      });
-    return set;
-  }, [bookings]);
-
-  const [selectedDate, setSelectedDate] = useState(null);
-
-  const dayBookings = useMemo(() => {
-    if (!selectedDate) return [];
-    return bookings
-      .filter((b) => b.status !== "cancelled" && b.checkIn <= selectedDate && selectedDate < b.checkOut)
-      .sort((a, b) => a.roomNumber.localeCompare(b.roomNumber));
-  }, [bookings, selectedDate]);
-
   const rangeEndExclusive = addDaysISO(rangeEnd, 1);
+
+  const roomNumberById = useMemo(() => {
+    const map = {};
+    (rooms || []).forEach((r) => {
+      map[r.id] = r.number;
+    });
+    return map;
+  }, [rooms]);
+
+  // Analytics fetches its own bounded slice of bookings instead of relying on
+  // the app-wide `bookings` array, which keeps growing for as long as the
+  // hotel operates — just the ones overlapping the selected revenue range.
+  // In local/demo mode (no hotelId) it falls back to filtering the in-memory
+  // array, since there's no Supabase table to query against.
+  const [rangeBookings, setRangeBookings] = useState([]);
+  const [loadingRange, setLoadingRange] = useState(true);
+  const [loadError, setLoadError] = useState("");
+
+  useEffect(() => {
+    if (!hotelId) {
+      setRangeBookings((bookings || []).filter((b) => b.checkIn < rangeEndExclusive && b.checkOut > rangeStart));
+      setLoadingRange(false);
+      return;
+    }
+    let cancelled = false;
+    setLoadingRange(true);
+    fetchBookingsOverlappingRange({ accessToken, hotelId, rangeStart, rangeEndExclusive, roomNumberById })
+      .then((rows) => {
+        if (!cancelled) setRangeBookings(rows);
+      })
+      .catch(() => {
+        if (!cancelled) setLoadError("Couldn't load bookings for this range — check your connection and try again.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingRange(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken, hotelId, bookings, rangeStart, rangeEndExclusive, roomNumberById]);
+
+  // Index once by room number (O(bookings)) instead of re-filtering the full
+  // array once per room (O(rooms × bookings)) — the loop that was freezing
+  // mobile browsers once the hotel had enough history.
+  const bookingsByRoom = useMemo(() => {
+    const map = new Map();
+    rangeBookings.forEach((b) => {
+      if (b.status === "cancelled") return;
+      if (!map.has(b.roomNumber)) map.set(b.roomNumber, []);
+      map.get(b.roomNumber).push(b);
+    });
+    return map;
+  }, [rangeBookings]);
 
   const perRoom = useMemo(() => {
     return rooms.map((room) => {
-      const roomBookings = bookings.filter((b) => b.roomNumber === room.number && b.status !== "cancelled");
+      const roomBookings = bookingsByRoom.get(room.number) || [];
       const reservations = roomBookings.filter((b) => b.checkIn >= rangeStart && b.checkIn < rangeEndExclusive).length;
       const stayedBookings = roomBookings.filter((b) => b.status === "checked_in" || b.status === "checked_out");
       const nights = stayedBookings.reduce(
@@ -3164,7 +3327,7 @@ function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRat
       }, 0);
       return { room, reservations, nights, maintenance, revenue };
     });
-  }, [rooms, bookings, maintenanceLog, rangeStart, rangeEndExclusive, roomRates, mealPlanRates]);
+  }, [rooms, bookingsByRoom, maintenanceLog, rangeStart, rangeEndExclusive, roomRates, mealPlanRates]);
 
   const totals = perRoom.reduce(
     (acc, r) => ({
@@ -3176,17 +3339,36 @@ function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRat
     { reservations: 0, nights: 0, maintenance: 0, revenue: 0 }
   );
 
-  const ticketsInRange = useMemo(
-    () =>
-      (tickets || [])
-        .filter((t) => t.date >= rangeStart && t.date < rangeEndExclusive)
-        .sort((a, b) => b.date.localeCompare(a.date)),
-    [tickets, rangeStart, rangeEndExclusive]
-  );
-  const ticketTotals = ticketsInRange.reduce(
-    (acc, t) => ({ count: acc.count + 1, persons: acc.persons + t.persons, revenue: acc.revenue + t.amountPaid }),
-    { count: 0, persons: 0, revenue: 0 }
-  );
+  // Ticket totals for the selected range are fetched as a small aggregate
+  // query rather than filtered from a fully-downloaded tickets table — the
+  // `tickets` prop is intentionally just a bounded recent slice (see
+  // INITIAL_TICKETS_LIMIT), so filtering it client-side would silently
+  // under-report revenue for any range older than that slice. In local/demo
+  // mode (no hotelId) we fall back to filtering the in-memory array.
+  const [ticketTotals, setTicketTotals] = useState({ count: 0, persons: 0, revenue: 0 });
+  useEffect(() => {
+    if (!hotelId) {
+      const inRange = (tickets || []).filter((t) => t.date >= rangeStart && t.date < rangeEndExclusive);
+      setTicketTotals(
+        inRange.reduce(
+          (acc, t) => ({ count: acc.count + 1, persons: acc.persons + t.persons, revenue: acc.revenue + t.amountPaid }),
+          { count: 0, persons: 0, revenue: 0 }
+        )
+      );
+      return;
+    }
+    let cancelled = false;
+    fetchTicketsRangeTotals({ accessToken, hotelId, rangeStart, rangeEndExclusive })
+      .then((result) => {
+        if (!cancelled) setTicketTotals(result);
+      })
+      .catch(() => {
+        // Leave the previous totals in place rather than flashing to zero on a transient error.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken, hotelId, tickets, rangeStart, rangeEndExclusive]);
   const grandRevenue = totals.revenue + ticketTotals.revenue;
 
   return (
@@ -3214,6 +3396,17 @@ function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRat
         </div>
       </div>
 
+      {loadError && (
+        <div style={{ color: TOKENS.oos, fontSize: "0.85rem", marginBottom: "0.75rem" }}>{loadError}</div>
+      )}
+
+      {loadingRange && rangeBookings.length === 0 ? (
+        // Header + title above have already painted by the time this shows —
+        // the range fetch and the O(bookings) computation below run after
+        // that first paint, not before it, so the tap never looks frozen.
+        <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem", padding: "2rem 0", textAlign: "center" }}>Loading analytics…</div>
+      ) : (
+      <>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "0.75rem", marginBottom: "1.5rem" }}>
         {[
           { label: "Reservations", value: totals.reservations },
@@ -3242,60 +3435,56 @@ function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRat
           <input type="date" value={rangeEnd} onChange={(e) => setRangeEnd(e.target.value)} style={inputStyle} />
         </div>
       </div>
+      </>
+      )}
+    </div>
+  );
+}
 
-      <div style={{ marginBottom: "1.5rem" }}>
-        <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
-          Reservation calendar
-        </div>
-        <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", alignItems: "flex-start" }}>
-          <MonthCalendar
-            year={calYear}
-            month={calMonth}
-            onMonthChange={(y, m) => {
-              setCalYear(y);
-              setCalMonth(m);
-              setSelectedDate(null);
+// Landing screen for the manager/analyst console. Deliberately fetches
+// nothing — each tab loads its own data only once the user picks it, so
+// opening the console never triggers every heavy query at once.
+function TabHomeScreen({ tabs, onSelect }) {
+  return (
+    <div
+      style={{
+        minHeight: "60vh",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "2rem 1rem",
+      }}
+    >
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+          gap: "1rem",
+          maxWidth: 640,
+          width: "100%",
+        }}
+      >
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            onClick={() => onSelect(t.id)}
+            style={{
+              background: "#fff",
+              border: `1px solid ${TOKENS.paperDim}`,
+              borderRadius: 12,
+              padding: "1.5rem 1rem",
+              fontFamily: "Fraunces, serif",
+              fontSize: "1.05rem",
+              fontWeight: 600,
+              color: TOKENS.ink,
+              cursor: "pointer",
+              textAlign: "center",
+              boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
             }}
-            highlightedDates={reservedDates}
-            todayIso={todayISO()}
-            onDayClick={setSelectedDate}
-            selectedDate={selectedDate}
-          />
-          <div style={{ ...cardStyle, flex: "1 1 260px", minWidth: 240, margin: 0 }}>
-            {!selectedDate && (
-              <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>Click a day on the calendar to see its reservations.</div>
-            )}
-            {selectedDate && (
-              <>
-                <div style={{ fontWeight: 600, marginBottom: 8 }}>{fmtDate(selectedDate)}</div>
-                {dayBookings.length === 0 && (
-                  <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>No reservations on this day.</div>
-                )}
-                {dayBookings.map((b) => (
-                  <div key={b.id} style={{ padding: "0.5rem 0", borderBottom: `1px solid ${TOKENS.paperDim}` }}>
-                    <div style={{ fontWeight: 600, fontSize: "0.85rem" }}>Room {b.roomNumber} · {guestName(b.guestId)}</div>
-                    <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft, marginBottom: 4 }}>
-                      {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)} · {b.status.replace("_", " ")}
-                    </div>
-                    <span
-                      style={{
-                        display: "inline-flex",
-                        fontSize: "0.66rem",
-                        fontWeight: 600,
-                        color: bookingTypeMeta(b.bookingType).color,
-                        background: bookingTypeMeta(b.bookingType).bg,
-                        borderRadius: 999,
-                        padding: "2px 8px",
-                      }}
-                    >
-                      {bookingTypeMeta(b.bookingType).label}
-                    </span>
-                  </div>
-                ))}
-              </>
-            )}
-          </div>
-        </div>
+          >
+            {t.label}
+          </button>
+        ))}
       </div>
     </div>
   );
@@ -3504,7 +3693,16 @@ function ReservationRecordsTab({ bookings, guestName, onDeleteBooking }) {
   );
 }
 
-function TicketRecordsTab({ tickets, onDeleteTicket }) {
+function TicketRecordsTab({ accessToken, hotelId, localTickets, onDeleteTicket }) {
+  // Local/demo mode has no Supabase table to page against — it's an in-memory
+  // array anyway, so keep the old client-side filtering behavior for it.
+  if (!hotelId) {
+    return <LocalTicketRecordsTab tickets={localTickets} onDeleteTicket={onDeleteTicket} />;
+  }
+  return <RemoteTicketRecordsTab accessToken={accessToken} hotelId={hotelId} onDeleteTicket={onDeleteTicket} />;
+}
+
+function LocalTicketRecordsTab({ tickets, onDeleteTicket }) {
   const [rangeStart, setRangeStart] = useState(todayISO());
   const [rangeEnd, setRangeEnd] = useState(todayISO());
   const rangeEndExclusive = addDaysISO(rangeEnd, 1);
@@ -3586,6 +3784,145 @@ function TicketRecordsTab({ tickets, onDeleteTicket }) {
               )}
             </div>
           ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RemoteTicketRecordsTab({ accessToken, hotelId, onDeleteTicket }) {
+  const [rangeStart, setRangeStart] = useState(todayISO());
+  const [rangeEnd, setRangeEnd] = useState(todayISO());
+  const [page, setPage] = useState(0);
+  const [pageRows, setPageRows] = useState([]);
+  const [pageTotal, setPageTotal] = useState(0);
+  const [totals, setTotals] = useState({ count: 0, persons: 0, revenue: 0 });
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const rangeEndExclusive = addDaysISO(rangeEnd, 1);
+
+  // Reset to page 0 whenever the date range changes — a page number from the
+  // previous range rarely makes sense for the new one.
+  useEffect(() => {
+    setPage(0);
+  }, [rangeStart, rangeEnd]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setLoadError("");
+    Promise.all([
+      fetchTicketsPage({ accessToken, hotelId, rangeStart, rangeEndExclusive, page }),
+      fetchTicketsRangeTotals({ accessToken, hotelId, rangeStart, rangeEndExclusive }),
+    ])
+      .then(([pageResult, totalsResult]) => {
+        if (cancelled) return;
+        setPageRows(pageResult.rows);
+        setPageTotal(pageResult.total);
+        setTotals(totalsResult);
+      })
+      .catch((e) => {
+        if (!cancelled) setLoadError("Couldn't load tickets for this range — check your connection and try again.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken, hotelId, rangeStart, rangeEndExclusive, page]);
+
+  const pageCount = Math.max(1, Math.ceil(pageTotal / TICKETS_PAGE_SIZE));
+
+  const handleDelete = (id) => {
+    onDeleteTicket && onDeleteTicket(id);
+    // Optimistically drop it from the current page so the list feels responsive;
+    // the next range/page change will re-fetch the authoritative data anyway.
+    setPageRows((rows) => rows.filter((t) => t.id !== id));
+  };
+
+  return (
+    <div>
+      <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", marginBottom: "1rem" }}>Ticket records</h2>
+
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginBottom: "1.5rem", flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>From</div>
+          <input type="date" value={rangeStart} onChange={(e) => setRangeStart(e.target.value)} style={inputStyle} />
+        </div>
+        <div>
+          <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>To</div>
+          <input type="date" value={rangeEnd} onChange={(e) => setRangeEnd(e.target.value)} style={inputStyle} />
+        </div>
+        <button
+          onClick={() => {
+            setRangeStart(todayISO());
+            setRangeEnd(todayISO());
+          }}
+          style={ghostBtn}
+        >
+          Today
+        </button>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "0.75rem", marginBottom: "1.5rem" }}>
+        {[
+          { label: "Tickets sold", value: totals.count },
+          { label: "Persons", value: totals.persons },
+          { label: "Revenue", value: fmtMoney(totals.revenue) },
+        ].map((c) => (
+          <div key={c.label} style={{ background: "#fff", border: `1px solid ${TOKENS.paperDim}`, borderRadius: 10, padding: "0.9rem" }}>
+            <div style={{ fontSize: "1.3rem", fontWeight: 600, fontFamily: "Fraunces, serif" }}>{c.value}</div>
+            <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>{c.label}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
+        Ticket records in range
+      </div>
+      {loadError && <div style={{ color: TOKENS.oos, fontSize: "0.85rem", marginBottom: 8 }}>{loadError}</div>}
+      {loading ? (
+        <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem" }}>Loading…</div>
+      ) : pageRows.length === 0 ? (
+        <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem" }}>No tickets logged in this range.</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {pageRows.map((t) => (
+            <div key={t.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+              <div>
+                <div style={{ fontWeight: 600 }}>
+                  {t.persons} {t.persons === 1 ? "person" : "persons"} · {fmtMoney(t.amountPaid)}
+                </div>
+                <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft }}>
+                  {fmtDate(t.date)}
+                  {t.notes ? ` · ${t.notes}` : ""}
+                </div>
+                <div style={{ fontSize: "0.72rem", color: TOKENS.brassDark, marginTop: 2 }}>
+                  Added by {t.createdBy || "unknown"}
+                </div>
+              </div>
+              {onDeleteTicket && (
+                <button onClick={() => handleDelete(t.id)} style={ghostBtn}>
+                  Delete
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {pageTotal > TICKETS_PAGE_SIZE && (
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 12 }}>
+          <button onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={page === 0 || loading} style={ghostBtn}>
+            ← Previous
+          </button>
+          <div style={{ fontSize: "0.8rem", color: TOKENS.inkSoft }}>
+            Page {page + 1} of {pageCount} · {pageTotal} tickets in range
+          </div>
+          <button onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))} disabled={page >= pageCount - 1 || loading} style={ghostBtn}>
+            Next →
+          </button>
         </div>
       )}
     </div>
@@ -3675,9 +4012,65 @@ function SimpleChart({ series, type }) {
   );
 }
 
-function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates }) {
+function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates, accessToken, hotelId, guestName }) {
   const [reportDate, setReportDate] = useState(todayISO());
   const isToday = reportDate === todayISO();
+
+  const roomNumberById = useMemo(() => {
+    const map = {};
+    (rooms || []).forEach((r) => {
+      map[r.id] = r.number;
+    });
+    return map;
+  }, [rooms]);
+
+  // The check-in/check-out room lists for the selected date are fetched with
+  // two narrow, exact-date queries — not filtered out of the full bookings
+  // array — so picking any date (past or future) costs the same regardless
+  // of how much booking history the hotel has accumulated. Local/demo mode
+  // (no hotelId) falls back to filtering the in-memory array.
+  const [checkInRooms, setCheckInRooms] = useState([]);
+  const [checkOutRooms, setCheckOutRooms] = useState([]);
+  const [loadingLists, setLoadingLists] = useState(true);
+  const [listError, setListError] = useState("");
+
+  useEffect(() => {
+    if (!hotelId) {
+      setCheckInRooms(
+        (bookings || [])
+          .filter((b) => b.status !== "cancelled" && b.checkIn === reportDate)
+          .sort((a, b) => a.roomNumber.localeCompare(b.roomNumber))
+      );
+      setCheckOutRooms(
+        (bookings || [])
+          .filter((b) => b.status !== "cancelled" && b.checkOut === reportDate)
+          .sort((a, b) => a.roomNumber.localeCompare(b.roomNumber))
+      );
+      setLoadingLists(false);
+      return;
+    }
+    let cancelled = false;
+    setLoadingLists(true);
+    setListError("");
+    Promise.all([
+      fetchCheckInsOnDate({ accessToken, hotelId, date: reportDate, roomNumberById }),
+      fetchCheckOutsOnDate({ accessToken, hotelId, date: reportDate, roomNumberById }),
+    ])
+      .then(([ins, outs]) => {
+        if (cancelled) return;
+        setCheckInRooms(ins.sort((a, b) => a.roomNumber.localeCompare(b.roomNumber)));
+        setCheckOutRooms(outs.sort((a, b) => a.roomNumber.localeCompare(b.roomNumber)));
+      })
+      .catch(() => {
+        if (!cancelled) setListError("Couldn't load check-in/check-out rooms for this date — check your connection and try again.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingLists(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken, hotelId, bookings, reportDate, roomNumberById]);
 
   const roomsReadyForCheckIn = isToday ? rooms.filter((r) => r.status === "vacant_clean").length : null;
   const checkInsToday = bookings.filter((b) => b.status !== "cancelled" && b.checkIn === reportDate).length;
@@ -3771,6 +4164,49 @@ function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates }) {
             <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>{c.label}</div>
           </div>
         ))}
+      </div>
+
+      {listError && <div style={{ color: TOKENS.oos, fontSize: "0.85rem", marginBottom: "0.75rem" }}>{listError}</div>}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "1rem", marginBottom: "1.75rem" }}>
+        <div style={cardStyle}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
+            Check-in rooms {isToday ? "today" : "on this day"}
+          </div>
+          {loadingLists ? (
+            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>Loading…</div>
+          ) : checkInRooms.length === 0 ? (
+            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>No check-ins on this day.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {checkInRooms.map((b) => (
+                <div key={b.id} style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem", borderBottom: `1px solid ${TOKENS.paperDim}`, paddingBottom: 4 }}>
+                  <span style={{ fontWeight: 600 }}>Room {b.roomNumber}</span>
+                  <span style={{ color: TOKENS.inkSoft }}>{guestName(b.guestId)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <div style={cardStyle}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
+            Check-out rooms {isToday ? "today" : "on this day"}
+          </div>
+          {loadingLists ? (
+            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>Loading…</div>
+          ) : checkOutRooms.length === 0 ? (
+            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>No check-outs on this day.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {checkOutRooms.map((b) => (
+                <div key={b.id} style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem", borderBottom: `1px solid ${TOKENS.paperDim}`, paddingBottom: 4 }}>
+                  <span style={{ fontWeight: 600 }}>Room {b.roomNumber}</span>
+                  <span style={{ color: TOKENS.inkSoft }}>{guestName(b.guestId)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
