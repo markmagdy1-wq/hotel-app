@@ -1,5 +1,88 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
+import * as XLSX from "xlsx";
 import loginBg from "./assets/login-bg.jpg";
+
+// ---- Finance (accountant role) field definitions ----
+// One row per calendar day per hotel. Field keys match the finance_daily
+// table columns in Supabase (see supabase/finance_setup.sql).
+const FINANCE_REVENUE_FIELDS = [
+  { key: "revenue_rooms", label: "الغرف" },
+  { key: "revenue_coffee_shop", label: "الكوفى شوب" },
+  { key: "revenue_pool_bar", label: "بار / حمام السباحة" },
+  { key: "revenue_beach", label: "الشاطئ" },
+  { key: "revenue_rentals", label: "إيجارات" },
+  { key: "revenue_other", label: "إيرادات أخرى" },
+];
+const FINANCE_EXPENSE_FIELDS = [
+  { key: "expense_operating", label: "مصاريف تشغيل" },
+  { key: "expense_salaries", label: "مرتبات" },
+  { key: "expense_partner_current", label: "جارى الشريك" },
+  { key: "expense_bank_deposit", label: "إيداع البنك" },
+  { key: "expense_staff_advances", label: "سلف الأسطاف" },
+  { key: "expense_fixed", label: "مصاريف ثابتة" },
+  { key: "expense_other", label: "مصاريف أخرى" },
+];
+const FINANCE_FIELD_KEYS = [...FINANCE_REVENUE_FIELDS, ...FINANCE_EXPENSE_FIELDS].map((f) => f.key);
+function emptyFinanceForm(dateISO) {
+  const base = { entry_date: dateISO || todayISO() };
+  FINANCE_FIELD_KEYS.forEach((k) => (base[k] = 0));
+  return base;
+}
+function financeCleanNumber(val) {
+  // Handles blanks, stray text, and scientific notation (e.g. "1E+05")
+  // the way it shows up in the accountant's Excel sheets.
+  if (val === undefined || val === null || val === "") return 0;
+  if (val instanceof Date) return 0;
+  const n = typeof val === "number" ? val : parseFloat(String(val).replace(/,/g, "").trim());
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0;
+}
+function financeRevenueTotal(row) {
+  return Math.round(FINANCE_REVENUE_FIELDS.reduce((sum, f) => sum + (Number(row[f.key]) || 0), 0) * 100) / 100;
+}
+function financeExpenseTotal(row) {
+  return Math.round(FINANCE_EXPENSE_FIELDS.reduce((sum, f) => sum + (Number(row[f.key]) || 0), 0) * 100) / 100;
+}
+// Alias dictionary used to auto-guess which spreadsheet column maps to which
+// finance field, based on the Arabic header text actually used in the
+// accountant's sheets (headers vary slightly month to month).
+const FINANCE_HEADER_ALIASES = [
+  { target: "entry_date", tests: ["التاريخ"] },
+  { target: "revenue_rooms", tests: ["الغرف"] },
+  { target: "revenue_coffee_shop", tests: ["كوفى"] },
+  { target: "revenue_pool_bar", tests: ["بار", "حمام"] },
+  { target: "revenue_beach", tests: ["الشاطئ", "شاطئ"] },
+  { target: "revenue_rentals", tests: ["ايجار", "إيجار"] },
+  { target: "revenue_other", tests: ["اخرى", "أخرى"] },
+  { target: "revenue_reported_total", tests: ["اجمالى الايراد", "إجمالى الإيراد"] },
+  { target: "expense_operating", tests: ["تشغيل"] },
+  { target: "expense_salaries", tests: ["مرتبات"] },
+  { target: "expense_partner_current", tests: ["جارى الشريك", "جاري الشريك"] },
+  { target: "expense_bank_deposit", tests: ["ايداع البنك", "إيداع البنك"] },
+  { target: "expense_staff_advances", tests: ["سلف"] },
+  { target: "expense_fixed", tests: ["م. ثابته", "ثابته", "ثابتة"] },
+  { target: "expense_reported_total", tests: ["اجمالى المصروفات", "إجمالى المصروفات"] },
+  { target: "expense_other", tests: ["ادوات مكتبيه", "أدوات مكتبية"] },
+  { target: "balance_previous", tests: ["الرصيد السابق"] },
+  { target: "balance_ending", tests: ["الرصيد النهائى", "الرصيد النهائي"] },
+];
+function guessFinanceFieldForHeader(headerText) {
+  const h = (headerText || "").replace(/\s+/g, "");
+  if (!h) return "ignore";
+  for (const alias of FINANCE_HEADER_ALIASES) {
+    if (alias.tests.some((t) => h.includes(t.replace(/\s+/g, "")))) return alias.target;
+  }
+  return "ignore";
+}
+const FINANCE_MAP_TARGETS = [
+  { value: "ignore", label: "— تجاهل —" },
+  { value: "entry_date", label: "التاريخ / رقم اليوم" },
+  ...FINANCE_REVENUE_FIELDS.map((f) => ({ value: f.key, label: `إيراد: ${f.label}` })),
+  { value: "revenue_reported_total", label: "إجمالى الإيراد (من الشيت، للمراجعة فقط)" },
+  ...FINANCE_EXPENSE_FIELDS.map((f) => ({ value: f.key, label: `مصروف: ${f.label}` })),
+  { value: "expense_reported_total", label: "إجمالى المصروفات (من الشيت، للمراجعة فقط)" },
+  { value: "balance_previous", label: "الرصيد السابق (مرجعي)" },
+  { value: "balance_ending", label: "الرصيد النهائى (مرجعي)" },
+];
 
 const TOKENS = {
   ink: "#1B2430",
@@ -93,93 +176,6 @@ async function supabaseRest(path, { accessToken, method = "GET", body, headers =
   }
   if (res.status === 204) return null;
   return res.json();
-}
-
-// How many rows we pull eagerly at login for the tables that only ever grow
-// (one row per ticket / maintenance entry, forever). Reception's "recent
-// tickets" list and the room-activity view only need a recent slice on first
-// paint — everything older is fetched on demand, paginated, by the tab that
-// actually needs it (see fetchTicketsPage below).
-const INITIAL_TICKETS_LIMIT = 50;
-const INITIAL_MAINTENANCE_LIMIT = 100;
-const TICKETS_PAGE_SIZE = 10;
-
-// True offset-based pagination against PostgREST (Supabase's REST layer).
-// PostgREST returns the total row count in the Content-Range header when we
-// ask for it via `Prefer: count=exact`, which is what lets us show
-// "Page X of Y" / disable the Next button without a second round trip.
-async function fetchTicketsPage({ accessToken, hotelId, rangeStart, rangeEndExclusive, page = 0, pageSize = TICKETS_PAGE_SIZE }) {
-  const offset = page * pageSize;
-  const res = await fetch(
-    `${SUPABASE_URL}/rest/v1/tickets?hotel_id=eq.${hotelId}&ticket_date=gte.${rangeStart}&ticket_date=lt.${rangeEndExclusive}` +
-      `&order=ticket_date.desc&limit=${pageSize}&offset=${offset}`,
-    {
-      headers: {
-        apikey: SUPABASE_ANON_KEY,
-        Authorization: `Bearer ${accessToken || SUPABASE_ANON_KEY}`,
-        Prefer: "count=exact",
-      },
-    }
-  );
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Supabase error ${res.status}: ${errText}`);
-  }
-  const rows = await res.json();
-  // Content-Range looks like "0-9/137" — the part after "/" is the total count.
-  const contentRange = res.headers.get("content-range") || "";
-  const total = Number(contentRange.split("/")[1]) || rows.length;
-  return { rows: rows.map(mapTicketFromDb), total, page, pageSize };
-}
-
-// Lightweight aggregate for the "Tickets sold / Persons / Revenue" summary
-// cards. We only ask Postgres for the two numeric columns we need to sum, for
-// tickets *inside the selected range* — not the whole table, and not the
-// full ticket rows. This keeps the totals accurate across the whole range
-// even though the list below it is paginated 10-at-a-time.
-async function fetchTicketsRangeTotals({ accessToken, hotelId, rangeStart, rangeEndExclusive }) {
-  const rows = await supabaseRest(
-    `tickets?hotel_id=eq.${hotelId}&ticket_date=gte.${rangeStart}&ticket_date=lt.${rangeEndExclusive}&select=persons,amount_paid`,
-    { accessToken }
-  );
-  return (rows || []).reduce(
-    (acc, r) => ({ count: acc.count + 1, persons: acc.persons + (r.persons || 0), revenue: acc.revenue + Number(r.amount_paid || 0) }),
-    { count: 0, persons: 0, revenue: 0 }
-  );
-}
-
-// Bookings that overlap a date window, fetched straight from Supabase instead
-// of filtered out of the full (unbounded, ever-growing) bookings array. Two
-// bookings "overlap" [rangeStart, rangeEndExclusive) when the booking starts
-// before the window ends AND ends after the window starts — the standard
-// interval-overlap test — which PostgREST expresses as two chained filters.
-// This is what keeps Analytics's workload bounded by "how much happened in
-// the selected range" instead of "how many bookings the hotel has ever had".
-async function fetchBookingsOverlappingRange({ accessToken, hotelId, rangeStart, rangeEndExclusive, roomNumberById }) {
-  const rows = await supabaseRest(
-    `bookings?hotel_id=eq.${hotelId}&check_in=lt.${rangeEndExclusive}&check_out=gt.${rangeStart}&order=check_in`,
-    { accessToken }
-  );
-  return (rows || []).map((b) => mapBookingFromDb(b, roomNumberById));
-}
-
-// Rooms checking in or checking out on one exact date, for the Today Report's
-// "select a day" view. Two narrow equality filters (check_in=eq.<date> /
-// check_out=eq.<date>) instead of scanning the whole bookings history — the
-// query cost stays flat no matter how long the hotel has been operating.
-async function fetchCheckInsOnDate({ accessToken, hotelId, date, roomNumberById }) {
-  const rows = await supabaseRest(
-    `bookings?hotel_id=eq.${hotelId}&check_in=eq.${date}&status=neq.cancelled&order=room_id`,
-    { accessToken }
-  );
-  return (rows || []).map((b) => mapBookingFromDb(b, roomNumberById));
-}
-async function fetchCheckOutsOnDate({ accessToken, hotelId, date, roomNumberById }) {
-  const rows = await supabaseRest(
-    `bookings?hotel_id=eq.${hotelId}&check_out=eq.${date}&status=neq.cancelled&order=room_id`,
-    { accessToken }
-  );
-  return (rows || []).map((b) => mapBookingFromDb(b, roomNumberById));
 }
 
 async function supabaseFunctionCall(fnName, accessToken, payload) {
@@ -367,7 +363,7 @@ function monthLabel(year, month) {
 
 const WEEKDAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
 
-function MonthCalendar({ year, month, onMonthChange, highlightedDates, todayIso, onDayClick, selectedDate, legendLabel, rangeStart, rangeEnd, showLegend = true }) {
+function MonthCalendar({ year, month, onMonthChange, highlightedDates, todayIso, onDayClick, selectedDate, legendLabel, rangeStart, rangeEnd }) {
   const pad = (n) => String(n).padStart(2, "0");
   const isoFor = (d) => `${year}-${pad(month + 1)}-${pad(d)}`;
   const numDays = new Date(year, month + 1, 0).getDate();
@@ -476,7 +472,7 @@ function MonthCalendar({ year, month, onMonthChange, highlightedDates, todayIso,
         })}
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginTop: 12, paddingTop: 10, borderTop: `1px solid ${TOKENS.paperDim}`, fontSize: "0.68rem", color: TOKENS.inkSoft }}>
-        {!showLegend ? null : (rangeStart !== undefined || rangeEnd !== undefined) ? (
+        {(rangeStart !== undefined || rangeEnd !== undefined) ? (
           <>
             <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
               <span style={{ width: 10, height: 10, borderRadius: "50%", background: TOKENS.reserved, display: "inline-block" }} />
@@ -582,7 +578,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
   const [mealPlanRates, setMealPlanRates] = useState(MEAL_PLAN_RATES);
   const [extraUsers, setExtraUsers] = useState([]);
   const [tab, setTab] = useState("rooms");
-  const [managerTab, setManagerTab] = useState("home");
+  const [managerTab, setManagerTab] = useState("analytics");
   const [selectedRoom, setSelectedRoom] = useState(null);
   const [showNewBooking, setShowNewBooking] = useState(false);
   const [showNewGuest, setShowNewGuest] = useState(false);
@@ -607,12 +603,8 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             supabaseRest(`rooms?hotel_id=eq.${hid}&order=number`, { accessToken: token }),
             supabaseRest(`guests?hotel_id=eq.${hid}&order=name`, { accessToken: token }),
             supabaseRest(`bookings?hotel_id=eq.${hid}&order=check_in`, { accessToken: token }),
-            // Bounded on purpose: the manager/reception tabs only ever show a handful of
-            // recent tickets on first paint (see TicketsTab). Historical ranges beyond this
-            // window are fetched on demand by TicketRecordsTab/AnalyticsDashboard instead of
-            // pulling the entire, ever-growing tickets table on every login.
-            supabaseRest(`tickets?hotel_id=eq.${hid}&order=ticket_date.desc&limit=${INITIAL_TICKETS_LIMIT}`, { accessToken: token }),
-            supabaseRest(`maintenance_log?hotel_id=eq.${hid}&order=logged_date.desc&limit=${INITIAL_MAINTENANCE_LIMIT}`, { accessToken: token }),
+            supabaseRest(`tickets?hotel_id=eq.${hid}&order=ticket_date.desc`, { accessToken: token }),
+            supabaseRest(`maintenance_log?hotel_id=eq.${hid}`, { accessToken: token }),
             supabaseRest(`room_rates?hotel_id=eq.${hid}`, { accessToken: token }),
             supabaseRest(`meal_plan_rates?hotel_id=eq.${hid}`, { accessToken: token }),
           ]);
@@ -766,7 +758,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         email: email.trim(),
         password,
         displayName: displayName.trim(),
-        role: userRole === "analyst" ? "analyst" : "reception",
+        role: userRole === "analyst" ? "analyst" : userRole === "accountant" ? "accountant" : userRole === "manager" ? "manager" : "reception",
       });
       await loadStaffList();
       return { ok: true };
@@ -1250,10 +1242,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             gap: "0.75rem",
           }}
         >
-          <div
-            onClick={() => setManagerTab("home")}
-            style={{ display: "flex", alignItems: "baseline", gap: "0.75rem", cursor: "pointer" }}
-          >
+          <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem" }}>
             <span style={{ fontFamily: "Fraunces, serif", fontSize: "1.5rem", fontWeight: 600, letterSpacing: "0.01em" }}>
               Geisum Hotel
             </span>
@@ -1293,6 +1282,8 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             { id: "ticketRecords", label: "Ticket records" },
             { id: "todayReport", label: "Today report" },
             { id: "pricing", label: "Room pricing" },
+            { id: "accountantReport", label: "Accountant report" },
+            { id: "users", label: "Users" },
           ].map((t) => (
             <button
               key={t.id}
@@ -1322,18 +1313,6 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         )}
 
         <main style={{ padding: "1.5rem", maxWidth: 1100, margin: "0 auto" }}>
-          {managerTab === "home" && (
-            <TabHomeScreen
-              tabs={[
-                { id: "analytics", label: "Analytics" },
-                { id: "roomActivity", label: "Room activity" },
-                { id: "ticketRecords", label: "Ticket records" },
-                { id: "todayReport", label: "Today report" },
-                { id: "pricing", label: "Room pricing" },
-              ]}
-              onSelect={setManagerTab}
-            />
-          )}
           {managerTab === "analytics" && (
             <AnalyticsDashboard
               rooms={rooms}
@@ -1342,8 +1321,6 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
               roomRates={roomRates}
               mealPlanRates={mealPlanRates}
               tickets={tickets}
-              accessToken={supabaseSession?.access_token}
-              hotelId={supabaseSession?.hotelId}
               onDeleteTicket={deleteTicket}
               guestName={guestName}
               onDeleteBooking={deleteBookingRecord}
@@ -1359,15 +1336,10 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             />
           )}
           {managerTab === "ticketRecords" && (
-            <TicketRecordsTab
-              accessToken={supabaseSession?.access_token}
-              hotelId={supabaseSession?.hotelId}
-              localTickets={tickets}
-              onDeleteTicket={deleteTicket}
-            />
+            <TicketRecordsTab tickets={tickets} onDeleteTicket={deleteTicket} />
           )}
           {managerTab === "todayReport" && (
-            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} />
+            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} />
           )}
           {managerTab === "pricing" && (
             <RoomPricingTab
@@ -1377,9 +1349,17 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
               onSaveMealPlans={updateMealPlanRates}
             />
           )}
+          {managerTab === "accountantReport" && <AccountantReportTab supabaseSession={supabaseSession} />}
+          {managerTab === "users" && (
+            <UsersTab extraUsers={extraUsers} onAddUser={addUser} onDeleteUser={deleteUser} supabaseSession={supabaseSession} />
+          )}
         </main>
       </div>
     );
+  }
+
+  if (role === "accountant") {
+    return <AccountantConsole supabaseSession={supabaseSession} onLogout={onLogout} />;
   }
 
   if (role === "analyst") {
@@ -1404,10 +1384,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             gap: "0.75rem",
           }}
         >
-          <div
-            onClick={() => setManagerTab("home")}
-            style={{ display: "flex", alignItems: "baseline", gap: "0.75rem", cursor: "pointer" }}
-          >
+          <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem" }}>
             <span style={{ fontFamily: "Fraunces, serif", fontSize: "1.5rem", fontWeight: 600, letterSpacing: "0.01em" }}>
               Geisum Hotel
             </span>
@@ -1476,18 +1453,6 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         )}
 
         <main style={{ padding: "1.5rem", maxWidth: 1100, margin: "0 auto" }}>
-          {managerTab === "home" && (
-            <TabHomeScreen
-              tabs={[
-                { id: "analytics", label: "Analytics" },
-                { id: "roomActivity", label: "Room activity" },
-                { id: "ticketRecords", label: "Ticket records" },
-                { id: "todayReport", label: "Today report" },
-                { id: "pricing", label: "Room pricing" },
-              ]}
-              onSelect={setManagerTab}
-            />
-          )}
           {managerTab === "analytics" && (
             <AnalyticsDashboard
               rooms={rooms}
@@ -1496,8 +1461,6 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
               roomRates={roomRates}
               mealPlanRates={mealPlanRates}
               tickets={tickets}
-              accessToken={supabaseSession?.access_token}
-              hotelId={supabaseSession?.hotelId}
               guestName={guestName}
             />
           )}
@@ -1510,15 +1473,9 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
               mealPlanRates={mealPlanRates}
             />
           )}
-          {managerTab === "ticketRecords" && (
-            <TicketRecordsTab
-              accessToken={supabaseSession?.access_token}
-              hotelId={supabaseSession?.hotelId}
-              localTickets={tickets}
-            />
-          )}
+          {managerTab === "ticketRecords" && <TicketRecordsTab tickets={tickets} />}
           {managerTab === "todayReport" && (
-            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} />
+            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} />
           )}
           {managerTab === "pricing" && (
             <RoomPricingTab
@@ -1723,7 +1680,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         )}
         {tab === "tickets" && <TicketsTab tickets={tickets} onAddTicket={addTicket} />}
         {tab === "todayReport" && (
-          <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} />
+          <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} />
         )}
       </main>
 
@@ -3241,67 +3198,40 @@ const ROOM_FILTERS = [
   { key: "revenue", label: "Revenue" },
 ];
 
-function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRates, mealPlanRates, tickets, accessToken, hotelId, onDeleteTicket, guestName, onDeleteBooking }) {
+function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRates, mealPlanRates, tickets, onDeleteTicket, guestName, onDeleteBooking }) {
   const [rangeStart, setRangeStart] = useState(startOfMonthISO());
   const [rangeEnd, setRangeEnd] = useState(todayISO());
-  const rangeEndExclusive = addDaysISO(rangeEnd, 1);
+  const [calYear, setCalYear] = useState(() => Number(todayISO().slice(0, 4)));
+  const [calMonth, setCalMonth] = useState(() => Number(todayISO().slice(5, 7)) - 1);
 
-  const roomNumberById = useMemo(() => {
-    const map = {};
-    (rooms || []).forEach((r) => {
-      map[r.id] = r.number;
-    });
-    return map;
-  }, [rooms]);
-
-  // Analytics fetches its own bounded slice of bookings instead of relying on
-  // the app-wide `bookings` array, which keeps growing for as long as the
-  // hotel operates — just the ones overlapping the selected revenue range.
-  // In local/demo mode (no hotelId) it falls back to filtering the in-memory
-  // array, since there's no Supabase table to query against.
-  const [rangeBookings, setRangeBookings] = useState([]);
-  const [loadingRange, setLoadingRange] = useState(true);
-  const [loadError, setLoadError] = useState("");
-
-  useEffect(() => {
-    if (!hotelId) {
-      setRangeBookings((bookings || []).filter((b) => b.checkIn < rangeEndExclusive && b.checkOut > rangeStart));
-      setLoadingRange(false);
-      return;
-    }
-    let cancelled = false;
-    setLoadingRange(true);
-    fetchBookingsOverlappingRange({ accessToken, hotelId, rangeStart, rangeEndExclusive, roomNumberById })
-      .then((rows) => {
-        if (!cancelled) setRangeBookings(rows);
-      })
-      .catch(() => {
-        if (!cancelled) setLoadError("Couldn't load bookings for this range — check your connection and try again.");
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingRange(false);
+  const reservedDates = useMemo(() => {
+    const set = new Set();
+    bookings
+      .filter((b) => b.status === "reserved" || b.status === "checked_in")
+      .forEach((b) => {
+        let d = b.checkIn;
+        while (d < b.checkOut) {
+          set.add(d);
+          d = addDaysISO(d, 1);
+        }
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [accessToken, hotelId, bookings, rangeStart, rangeEndExclusive, roomNumberById]);
+    return set;
+  }, [bookings]);
 
-  // Index once by room number (O(bookings)) instead of re-filtering the full
-  // array once per room (O(rooms × bookings)) — the loop that was freezing
-  // mobile browsers once the hotel had enough history.
-  const bookingsByRoom = useMemo(() => {
-    const map = new Map();
-    rangeBookings.forEach((b) => {
-      if (b.status === "cancelled") return;
-      if (!map.has(b.roomNumber)) map.set(b.roomNumber, []);
-      map.get(b.roomNumber).push(b);
-    });
-    return map;
-  }, [rangeBookings]);
+  const [selectedDate, setSelectedDate] = useState(null);
+
+  const dayBookings = useMemo(() => {
+    if (!selectedDate) return [];
+    return bookings
+      .filter((b) => b.status !== "cancelled" && b.checkIn <= selectedDate && selectedDate < b.checkOut)
+      .sort((a, b) => a.roomNumber.localeCompare(b.roomNumber));
+  }, [bookings, selectedDate]);
+
+  const rangeEndExclusive = addDaysISO(rangeEnd, 1);
 
   const perRoom = useMemo(() => {
     return rooms.map((room) => {
-      const roomBookings = bookingsByRoom.get(room.number) || [];
+      const roomBookings = bookings.filter((b) => b.roomNumber === room.number && b.status !== "cancelled");
       const reservations = roomBookings.filter((b) => b.checkIn >= rangeStart && b.checkIn < rangeEndExclusive).length;
       const stayedBookings = roomBookings.filter((b) => b.status === "checked_in" || b.status === "checked_out");
       const nights = stayedBookings.reduce(
@@ -3327,7 +3257,7 @@ function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRat
       }, 0);
       return { room, reservations, nights, maintenance, revenue };
     });
-  }, [rooms, bookingsByRoom, maintenanceLog, rangeStart, rangeEndExclusive, roomRates, mealPlanRates]);
+  }, [rooms, bookings, maintenanceLog, rangeStart, rangeEndExclusive, roomRates, mealPlanRates]);
 
   const totals = perRoom.reduce(
     (acc, r) => ({
@@ -3339,36 +3269,17 @@ function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRat
     { reservations: 0, nights: 0, maintenance: 0, revenue: 0 }
   );
 
-  // Ticket totals for the selected range are fetched as a small aggregate
-  // query rather than filtered from a fully-downloaded tickets table — the
-  // `tickets` prop is intentionally just a bounded recent slice (see
-  // INITIAL_TICKETS_LIMIT), so filtering it client-side would silently
-  // under-report revenue for any range older than that slice. In local/demo
-  // mode (no hotelId) we fall back to filtering the in-memory array.
-  const [ticketTotals, setTicketTotals] = useState({ count: 0, persons: 0, revenue: 0 });
-  useEffect(() => {
-    if (!hotelId) {
-      const inRange = (tickets || []).filter((t) => t.date >= rangeStart && t.date < rangeEndExclusive);
-      setTicketTotals(
-        inRange.reduce(
-          (acc, t) => ({ count: acc.count + 1, persons: acc.persons + t.persons, revenue: acc.revenue + t.amountPaid }),
-          { count: 0, persons: 0, revenue: 0 }
-        )
-      );
-      return;
-    }
-    let cancelled = false;
-    fetchTicketsRangeTotals({ accessToken, hotelId, rangeStart, rangeEndExclusive })
-      .then((result) => {
-        if (!cancelled) setTicketTotals(result);
-      })
-      .catch(() => {
-        // Leave the previous totals in place rather than flashing to zero on a transient error.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [accessToken, hotelId, tickets, rangeStart, rangeEndExclusive]);
+  const ticketsInRange = useMemo(
+    () =>
+      (tickets || [])
+        .filter((t) => t.date >= rangeStart && t.date < rangeEndExclusive)
+        .sort((a, b) => b.date.localeCompare(a.date)),
+    [tickets, rangeStart, rangeEndExclusive]
+  );
+  const ticketTotals = ticketsInRange.reduce(
+    (acc, t) => ({ count: acc.count + 1, persons: acc.persons + t.persons, revenue: acc.revenue + t.amountPaid }),
+    { count: 0, persons: 0, revenue: 0 }
+  );
   const grandRevenue = totals.revenue + ticketTotals.revenue;
 
   return (
@@ -3396,17 +3307,6 @@ function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRat
         </div>
       </div>
 
-      {loadError && (
-        <div style={{ color: TOKENS.oos, fontSize: "0.85rem", marginBottom: "0.75rem" }}>{loadError}</div>
-      )}
-
-      {loadingRange && rangeBookings.length === 0 ? (
-        // Header + title above have already painted by the time this shows —
-        // the range fetch and the O(bookings) computation below run after
-        // that first paint, not before it, so the tap never looks frozen.
-        <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem", padding: "2rem 0", textAlign: "center" }}>Loading analytics…</div>
-      ) : (
-      <>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "0.75rem", marginBottom: "1.5rem" }}>
         {[
           { label: "Reservations", value: totals.reservations },
@@ -3435,56 +3335,60 @@ function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRat
           <input type="date" value={rangeEnd} onChange={(e) => setRangeEnd(e.target.value)} style={inputStyle} />
         </div>
       </div>
-      </>
-      )}
-    </div>
-  );
-}
 
-// Landing screen for the manager/analyst console. Deliberately fetches
-// nothing — each tab loads its own data only once the user picks it, so
-// opening the console never triggers every heavy query at once.
-function TabHomeScreen({ tabs, onSelect }) {
-  return (
-    <div
-      style={{
-        minHeight: "60vh",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: "2rem 1rem",
-      }}
-    >
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-          gap: "1rem",
-          maxWidth: 640,
-          width: "100%",
-        }}
-      >
-        {tabs.map((t) => (
-          <button
-            key={t.id}
-            onClick={() => onSelect(t.id)}
-            style={{
-              background: "#fff",
-              border: `1px solid ${TOKENS.paperDim}`,
-              borderRadius: 12,
-              padding: "1.5rem 1rem",
-              fontFamily: "Fraunces, serif",
-              fontSize: "1.05rem",
-              fontWeight: 600,
-              color: TOKENS.ink,
-              cursor: "pointer",
-              textAlign: "center",
-              boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
+      <div style={{ marginBottom: "1.5rem" }}>
+        <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
+          Reservation calendar
+        </div>
+        <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", alignItems: "flex-start" }}>
+          <MonthCalendar
+            year={calYear}
+            month={calMonth}
+            onMonthChange={(y, m) => {
+              setCalYear(y);
+              setCalMonth(m);
+              setSelectedDate(null);
             }}
-          >
-            {t.label}
-          </button>
-        ))}
+            highlightedDates={reservedDates}
+            todayIso={todayISO()}
+            onDayClick={setSelectedDate}
+            selectedDate={selectedDate}
+          />
+          <div style={{ ...cardStyle, flex: "1 1 260px", minWidth: 240, margin: 0 }}>
+            {!selectedDate && (
+              <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>Click a day on the calendar to see its reservations.</div>
+            )}
+            {selectedDate && (
+              <>
+                <div style={{ fontWeight: 600, marginBottom: 8 }}>{fmtDate(selectedDate)}</div>
+                {dayBookings.length === 0 && (
+                  <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>No reservations on this day.</div>
+                )}
+                {dayBookings.map((b) => (
+                  <div key={b.id} style={{ padding: "0.5rem 0", borderBottom: `1px solid ${TOKENS.paperDim}` }}>
+                    <div style={{ fontWeight: 600, fontSize: "0.85rem" }}>Room {b.roomNumber} · {guestName(b.guestId)}</div>
+                    <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft, marginBottom: 4 }}>
+                      {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)} · {b.status.replace("_", " ")}
+                    </div>
+                    <span
+                      style={{
+                        display: "inline-flex",
+                        fontSize: "0.66rem",
+                        fontWeight: 600,
+                        color: bookingTypeMeta(b.bookingType).color,
+                        background: bookingTypeMeta(b.bookingType).bg,
+                        borderRadius: 999,
+                        padding: "2px 8px",
+                      }}
+                    >
+                      {bookingTypeMeta(b.bookingType).label}
+                    </span>
+                  </div>
+                ))}
+              </>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -3693,16 +3597,7 @@ function ReservationRecordsTab({ bookings, guestName, onDeleteBooking }) {
   );
 }
 
-function TicketRecordsTab({ accessToken, hotelId, localTickets, onDeleteTicket }) {
-  // Local/demo mode has no Supabase table to page against — it's an in-memory
-  // array anyway, so keep the old client-side filtering behavior for it.
-  if (!hotelId) {
-    return <LocalTicketRecordsTab tickets={localTickets} onDeleteTicket={onDeleteTicket} />;
-  }
-  return <RemoteTicketRecordsTab accessToken={accessToken} hotelId={hotelId} onDeleteTicket={onDeleteTicket} />;
-}
-
-function LocalTicketRecordsTab({ tickets, onDeleteTicket }) {
+function TicketRecordsTab({ tickets, onDeleteTicket }) {
   const [rangeStart, setRangeStart] = useState(todayISO());
   const [rangeEnd, setRangeEnd] = useState(todayISO());
   const rangeEndExclusive = addDaysISO(rangeEnd, 1);
@@ -3784,145 +3679,6 @@ function LocalTicketRecordsTab({ tickets, onDeleteTicket }) {
               )}
             </div>
           ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function RemoteTicketRecordsTab({ accessToken, hotelId, onDeleteTicket }) {
-  const [rangeStart, setRangeStart] = useState(todayISO());
-  const [rangeEnd, setRangeEnd] = useState(todayISO());
-  const [page, setPage] = useState(0);
-  const [pageRows, setPageRows] = useState([]);
-  const [pageTotal, setPageTotal] = useState(0);
-  const [totals, setTotals] = useState({ count: 0, persons: 0, revenue: 0 });
-  const [loading, setLoading] = useState(false);
-  const [loadError, setLoadError] = useState("");
-  const rangeEndExclusive = addDaysISO(rangeEnd, 1);
-
-  // Reset to page 0 whenever the date range changes — a page number from the
-  // previous range rarely makes sense for the new one.
-  useEffect(() => {
-    setPage(0);
-  }, [rangeStart, rangeEnd]);
-
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setLoadError("");
-    Promise.all([
-      fetchTicketsPage({ accessToken, hotelId, rangeStart, rangeEndExclusive, page }),
-      fetchTicketsRangeTotals({ accessToken, hotelId, rangeStart, rangeEndExclusive }),
-    ])
-      .then(([pageResult, totalsResult]) => {
-        if (cancelled) return;
-        setPageRows(pageResult.rows);
-        setPageTotal(pageResult.total);
-        setTotals(totalsResult);
-      })
-      .catch((e) => {
-        if (!cancelled) setLoadError("Couldn't load tickets for this range — check your connection and try again.");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [accessToken, hotelId, rangeStart, rangeEndExclusive, page]);
-
-  const pageCount = Math.max(1, Math.ceil(pageTotal / TICKETS_PAGE_SIZE));
-
-  const handleDelete = (id) => {
-    onDeleteTicket && onDeleteTicket(id);
-    // Optimistically drop it from the current page so the list feels responsive;
-    // the next range/page change will re-fetch the authoritative data anyway.
-    setPageRows((rows) => rows.filter((t) => t.id !== id));
-  };
-
-  return (
-    <div>
-      <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", marginBottom: "1rem" }}>Ticket records</h2>
-
-      <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginBottom: "1.5rem", flexWrap: "wrap" }}>
-        <div>
-          <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>From</div>
-          <input type="date" value={rangeStart} onChange={(e) => setRangeStart(e.target.value)} style={inputStyle} />
-        </div>
-        <div>
-          <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>To</div>
-          <input type="date" value={rangeEnd} onChange={(e) => setRangeEnd(e.target.value)} style={inputStyle} />
-        </div>
-        <button
-          onClick={() => {
-            setRangeStart(todayISO());
-            setRangeEnd(todayISO());
-          }}
-          style={ghostBtn}
-        >
-          Today
-        </button>
-      </div>
-
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "0.75rem", marginBottom: "1.5rem" }}>
-        {[
-          { label: "Tickets sold", value: totals.count },
-          { label: "Persons", value: totals.persons },
-          { label: "Revenue", value: fmtMoney(totals.revenue) },
-        ].map((c) => (
-          <div key={c.label} style={{ background: "#fff", border: `1px solid ${TOKENS.paperDim}`, borderRadius: 10, padding: "0.9rem" }}>
-            <div style={{ fontSize: "1.3rem", fontWeight: 600, fontFamily: "Fraunces, serif" }}>{c.value}</div>
-            <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>{c.label}</div>
-          </div>
-        ))}
-      </div>
-
-      <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
-        Ticket records in range
-      </div>
-      {loadError && <div style={{ color: TOKENS.oos, fontSize: "0.85rem", marginBottom: 8 }}>{loadError}</div>}
-      {loading ? (
-        <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem" }}>Loading…</div>
-      ) : pageRows.length === 0 ? (
-        <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem" }}>No tickets logged in this range.</div>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {pageRows.map((t) => (
-            <div key={t.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-              <div>
-                <div style={{ fontWeight: 600 }}>
-                  {t.persons} {t.persons === 1 ? "person" : "persons"} · {fmtMoney(t.amountPaid)}
-                </div>
-                <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft }}>
-                  {fmtDate(t.date)}
-                  {t.notes ? ` · ${t.notes}` : ""}
-                </div>
-                <div style={{ fontSize: "0.72rem", color: TOKENS.brassDark, marginTop: 2 }}>
-                  Added by {t.createdBy || "unknown"}
-                </div>
-              </div>
-              {onDeleteTicket && (
-                <button onClick={() => handleDelete(t.id)} style={ghostBtn}>
-                  Delete
-                </button>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {pageTotal > TICKETS_PAGE_SIZE && (
-        <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 12 }}>
-          <button onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={page === 0 || loading} style={ghostBtn}>
-            ← Previous
-          </button>
-          <div style={{ fontSize: "0.8rem", color: TOKENS.inkSoft }}>
-            Page {page + 1} of {pageCount} · {pageTotal} tickets in range
-          </div>
-          <button onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))} disabled={page >= pageCount - 1 || loading} style={ghostBtn}>
-            Next →
-          </button>
         </div>
       )}
     </div>
@@ -4012,65 +3768,9 @@ function SimpleChart({ series, type }) {
   );
 }
 
-function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates, accessToken, hotelId, guestName }) {
+function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates }) {
   const [reportDate, setReportDate] = useState(todayISO());
   const isToday = reportDate === todayISO();
-
-  const roomNumberById = useMemo(() => {
-    const map = {};
-    (rooms || []).forEach((r) => {
-      map[r.id] = r.number;
-    });
-    return map;
-  }, [rooms]);
-
-  // The check-in/check-out room lists for the selected date are fetched with
-  // two narrow, exact-date queries — not filtered out of the full bookings
-  // array — so picking any date (past or future) costs the same regardless
-  // of how much booking history the hotel has accumulated. Local/demo mode
-  // (no hotelId) falls back to filtering the in-memory array.
-  const [checkInRooms, setCheckInRooms] = useState([]);
-  const [checkOutRooms, setCheckOutRooms] = useState([]);
-  const [loadingLists, setLoadingLists] = useState(true);
-  const [listError, setListError] = useState("");
-
-  useEffect(() => {
-    if (!hotelId) {
-      setCheckInRooms(
-        (bookings || [])
-          .filter((b) => b.status !== "cancelled" && b.checkIn === reportDate)
-          .sort((a, b) => a.roomNumber.localeCompare(b.roomNumber))
-      );
-      setCheckOutRooms(
-        (bookings || [])
-          .filter((b) => b.status !== "cancelled" && b.checkOut === reportDate)
-          .sort((a, b) => a.roomNumber.localeCompare(b.roomNumber))
-      );
-      setLoadingLists(false);
-      return;
-    }
-    let cancelled = false;
-    setLoadingLists(true);
-    setListError("");
-    Promise.all([
-      fetchCheckInsOnDate({ accessToken, hotelId, date: reportDate, roomNumberById }),
-      fetchCheckOutsOnDate({ accessToken, hotelId, date: reportDate, roomNumberById }),
-    ])
-      .then(([ins, outs]) => {
-        if (cancelled) return;
-        setCheckInRooms(ins.sort((a, b) => a.roomNumber.localeCompare(b.roomNumber)));
-        setCheckOutRooms(outs.sort((a, b) => a.roomNumber.localeCompare(b.roomNumber)));
-      })
-      .catch(() => {
-        if (!cancelled) setListError("Couldn't load check-in/check-out rooms for this date — check your connection and try again.");
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingLists(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [accessToken, hotelId, bookings, reportDate, roomNumberById]);
 
   const roomsReadyForCheckIn = isToday ? rooms.filter((r) => r.status === "vacant_clean").length : null;
   const checkInsToday = bookings.filter((b) => b.status !== "cancelled" && b.checkIn === reportDate).length;
@@ -4166,49 +3866,6 @@ function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates, accessToken
         ))}
       </div>
 
-      {listError && <div style={{ color: TOKENS.oos, fontSize: "0.85rem", marginBottom: "0.75rem" }}>{listError}</div>}
-
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "1rem", marginBottom: "1.75rem" }}>
-        <div style={cardStyle}>
-          <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
-            Check-in rooms {isToday ? "today" : "on this day"}
-          </div>
-          {loadingLists ? (
-            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>Loading…</div>
-          ) : checkInRooms.length === 0 ? (
-            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>No check-ins on this day.</div>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {checkInRooms.map((b) => (
-                <div key={b.id} style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem", borderBottom: `1px solid ${TOKENS.paperDim}`, paddingBottom: 4 }}>
-                  <span style={{ fontWeight: 600 }}>Room {b.roomNumber}</span>
-                  <span style={{ color: TOKENS.inkSoft }}>{guestName(b.guestId)}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-        <div style={cardStyle}>
-          <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
-            Check-out rooms {isToday ? "today" : "on this day"}
-          </div>
-          {loadingLists ? (
-            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>Loading…</div>
-          ) : checkOutRooms.length === 0 ? (
-            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>No check-outs on this day.</div>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {checkOutRooms.map((b) => (
-                <div key={b.id} style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem", borderBottom: `1px solid ${TOKENS.paperDim}`, paddingBottom: 4 }}>
-                  <span style={{ fontWeight: 600 }}>Room {b.roomNumber}</span>
-                  <span style={{ color: TOKENS.inkSoft }}>{guestName(b.guestId)}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
-
       <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
         Meal plan breakdown — guests on property {isToday ? "today" : "this day"}
       </div>
@@ -4258,6 +3915,978 @@ function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates, accessToken
   );
 }
 
+function FinanceLineChart({ rows }) {
+  const width = 640;
+  const height = 260;
+  const padding = { top: 16, right: 16, bottom: 36, left: 56 };
+  const innerW = width - padding.left - padding.right;
+  const innerH = height - padding.top - padding.bottom;
+  const maxVal = Math.max(1, ...rows.map((r) => Math.max(r.revenue_total, r.expenses_total)));
+  const stepX = rows.length > 1 ? innerW / (rows.length - 1) : innerW;
+  const xFor = (i) => padding.left + (rows.length > 1 ? i * stepX : innerW / 2);
+  const yFor = (v) => padding.top + innerH - (v / maxVal) * innerH;
+  const lineFor = (field) => rows.map((r, i) => `${xFor(i)},${yFor(r[field])}`).join(" ");
+
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", maxWidth: 640, height: "auto" }}>
+      {[0, 0.25, 0.5, 0.75, 1].map((f) => (
+        <line key={f} x1={padding.left} x2={width - padding.right} y1={padding.top + innerH * (1 - f)} y2={padding.top + innerH * (1 - f)} stroke={TOKENS.paperDim} strokeWidth="1" />
+      ))}
+      {[0, 0.25, 0.5, 0.75, 1].map((f) => (
+        <text key={f} x={padding.left - 8} y={padding.top + innerH * (1 - f) + 4} textAnchor="end" fontSize="10" fill={TOKENS.inkSoft}>
+          {Math.round(maxVal * f).toLocaleString()}
+        </text>
+      ))}
+      <polyline points={lineFor("revenue_total")} fill="none" stroke={TOKENS.clean} strokeWidth="2.5" />
+      <polyline points={lineFor("expenses_total")} fill="none" stroke={TOKENS.oos} strokeWidth="2.5" />
+      {rows.map((r, i) =>
+        i % Math.max(1, Math.ceil(rows.length / 10)) === 0 ? (
+          <text key={r.entry_date} x={xFor(i)} y={height - padding.bottom + 16} textAnchor="middle" fontSize="9" fill={TOKENS.inkSoft}>
+            {r.entry_date.slice(5)}
+          </text>
+        ) : null
+      )}
+      <circle cx={padding.left} cy={14} r="4" fill={TOKENS.clean} />
+      <text x={padding.left + 10} y={18} fontSize="10" fill={TOKENS.inkSoft}>Revenue</text>
+      <circle cx={padding.left + 80} cy={14} r="4" fill={TOKENS.oos} />
+      <text x={padding.left + 90} y={18} fontSize="10" fill={TOKENS.inkSoft}>Expenses</text>
+    </svg>
+  );
+}
+
+// ---- Accountant console ----
+// Fully separate from HotelReceptionApp's rooms/bookings/guests state — the
+// accountant role only ever reads/writes the finance_daily table, scoped by
+// RLS to their own hotel_id. See supabase/finance_setup.sql for the schema
+// and policies this depends on.
+function AccountantConsole({ supabaseSession, onLogout }) {
+  const [tab, setTab] = useState("entry");
+  const [rows, setRows] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  const hotelId = supabaseSession && supabaseSession.hotelId;
+  const token = supabaseSession && supabaseSession.access_token;
+
+  const loadRows = async () => {
+    if (!hotelId) return;
+    try {
+      const data = await supabaseRest(`finance_daily?hotel_id=eq.${hotelId}&order=entry_date.desc&limit=180`, { accessToken: token });
+      setRows(data || []);
+    } catch (e) {
+      setError(`Couldn't load finance history: ${e.message}`);
+    } finally {
+      setLoaded(true);
+    }
+  };
+
+  useEffect(() => {
+    loadRows();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hotelId]);
+
+  const flash = (msg) => {
+    setNotice(msg);
+    setTimeout(() => setNotice(""), 4000);
+  };
+  const flashError = (msg) => {
+    setError(msg);
+    setTimeout(() => setError(""), 6000);
+  };
+
+  // Saves one or many finance_daily rows at once (upsert on hotel_id+entry_date).
+  const saveRows = async (draftRows) => {
+    if (!hotelId) {
+      flashError("You're not linked to a hotel yet — sign in with a real accountant account.");
+      return false;
+    }
+    const payload = draftRows.map((r) => ({
+      hotel_id: hotelId,
+      entry_date: r.entry_date,
+      ...Object.fromEntries(FINANCE_FIELD_KEYS.map((k) => [k, financeCleanNumber(r[k])])),
+      revenue_reported_total: r.revenue_reported_total !== undefined && r.revenue_reported_total !== "" ? financeCleanNumber(r.revenue_reported_total) : null,
+      expense_reported_total: r.expense_reported_total !== undefined && r.expense_reported_total !== "" ? financeCleanNumber(r.expense_reported_total) : null,
+      balance_previous: r.balance_previous !== undefined && r.balance_previous !== "" ? financeCleanNumber(r.balance_previous) : null,
+      balance_ending: r.balance_ending !== undefined && r.balance_ending !== "" ? financeCleanNumber(r.balance_ending) : null,
+      revenue_total: financeRevenueTotal(r),
+      expenses_total: financeExpenseTotal(r),
+    }));
+    try {
+      // on_conflict must be spelled out here: finance_daily has its own `id`
+      // primary key, so without this PostgREST would only de-dupe against
+      // `id` (which new rows never collide on) instead of (hotel_id, entry_date).
+      await supabaseRest("finance_daily?on_conflict=hotel_id,entry_date", {
+        accessToken: token,
+        method: "POST",
+        body: payload,
+        headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+      });
+      await loadRows();
+      return true;
+    } catch (e) {
+      flashError(`Couldn't save: ${e.message}`);
+      return false;
+    }
+  };
+
+  return (
+    <div style={{ fontFamily: "Inter, sans-serif", background: TOKENS.paper, minHeight: "100vh", color: TOKENS.ink }}>
+      <header
+        style={{
+          background: TOKENS.ink,
+          color: TOKENS.paper,
+          padding: "1.25rem 1.5rem",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          flexWrap: "wrap",
+          gap: "0.75rem",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem" }}>
+          <span style={{ fontFamily: "Fraunces, serif", fontSize: "1.5rem", fontWeight: 600, letterSpacing: "0.01em" }}>Geisum Hotel</span>
+          <span style={{ fontSize: "0.75rem", color: TOKENS.brass, letterSpacing: "0.08em", textTransform: "uppercase" }}>Accountant console</span>
+        </div>
+        <button
+          onClick={onLogout}
+          style={{ background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.2)", borderRadius: 8, padding: "0.4rem 0.8rem", color: TOKENS.paper, fontSize: "0.8rem", cursor: "pointer" }}
+        >
+          Sign out
+        </button>
+      </header>
+
+      <nav style={{ display: "flex", gap: "0.25rem", padding: "0.75rem 1.5rem 0", borderBottom: `1px solid ${TOKENS.paperDim}`, background: TOKENS.paper, flexWrap: "wrap" }}>
+        {[
+          { id: "entry", label: "Daily entry" },
+          { id: "import", label: "Import from Excel" },
+          { id: "history", label: "History & chart" },
+        ].map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id)}
+            style={{
+              border: "none",
+              background: "transparent",
+              padding: "0.6rem 1rem",
+              fontFamily: "Inter, sans-serif",
+              fontSize: "0.9rem",
+              fontWeight: 500,
+              color: tab === t.id ? TOKENS.ink : TOKENS.inkSoft,
+              borderBottom: tab === t.id ? `2px solid ${TOKENS.brass}` : "2px solid transparent",
+              cursor: "pointer",
+              opacity: tab === t.id ? 1 : 0.6,
+            }}
+          >
+            {t.label}
+          </button>
+        ))}
+      </nav>
+
+      {error && <div style={{ background: TOKENS.oosBg, color: TOKENS.oos, padding: "0.5rem 1.5rem", fontSize: "0.85rem" }}>{error}</div>}
+      {notice && <div style={{ background: TOKENS.cleanBg, color: TOKENS.clean, padding: "0.5rem 1.5rem", fontSize: "0.85rem" }}>{notice}</div>}
+
+      <main style={{ padding: "1.5rem", maxWidth: 1100, margin: "0 auto" }}>
+        {!loaded ? (
+          <div style={{ color: TOKENS.inkSoft }}>Loading…</div>
+        ) : (
+          <>
+            {tab === "entry" && (
+              <FinanceDailyEntryTab
+                existingRows={rows}
+                onSave={async (row) => {
+                  const ok = await saveRows([row]);
+                  if (ok) flash(`تم حفظ يوم ${row.entry_date}.`);
+                }}
+              />
+            )}
+            {tab === "import" && (
+              <FinanceExcelImportTab
+                onSaveMany={async (draftRows) => {
+                  const ok = await saveRows(draftRows);
+                  if (ok) flash(`تم حفظ ورفع ${draftRows.length} يوم بنجاح.`);
+                  return ok;
+                }}
+              />
+            )}
+            {tab === "history" && <FinanceHistoryTab rows={rows} />}
+          </>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function FinanceDailyEntryTab({ existingRows, onSave }) {
+  const [form, setForm] = useState(emptyFinanceForm());
+  const [saving, setSaving] = useState(false);
+
+  // If the accountant picks a date that already has a saved entry, load it
+  // for editing instead of starting from zero.
+  useEffect(() => {
+    const existing = existingRows.find((r) => r.entry_date === form.entry_date);
+    if (existing) {
+      const next = { entry_date: existing.entry_date };
+      FINANCE_FIELD_KEYS.forEach((k) => (next[k] = Number(existing[k]) || 0));
+      setForm(next);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.entry_date]);
+
+  const revenueTotal = financeRevenueTotal(form);
+  const expenseTotal = financeExpenseTotal(form);
+
+  const setField = (key, value) => setForm((prev) => ({ ...prev, [key]: value === "" ? "" : Number(value) }));
+
+  const submit = async () => {
+    setSaving(true);
+    await onSave(form);
+    setSaving(false);
+  };
+
+  return (
+    <div>
+      <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", marginBottom: "0.5rem" }}>Daily entry</h2>
+      <div style={{ fontSize: "0.85rem", color: TOKENS.inkSoft, marginBottom: "1rem" }}>
+        Pick a date — if it's already saved, the fields below load for editing. Totals update as you type.
+      </div>
+
+      <div style={{ marginBottom: "1rem" }}>
+        <label style={{ display: "block", fontSize: "0.8rem", color: TOKENS.inkSoft, marginBottom: 4 }}>التاريخ</label>
+        <input type="date" value={form.entry_date} onChange={(e) => setForm((p) => ({ ...p, entry_date: e.target.value }))} style={inputStyle} />
+      </div>
+
+      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 260, background: TOKENS.cleanBg, padding: "1rem", borderRadius: 10 }}>
+          <div style={{ fontWeight: 600, marginBottom: 8 }}>الإيرادات (إجمالى: {revenueTotal.toLocaleString()})</div>
+          {FINANCE_REVENUE_FIELDS.map((f) => (
+            <div key={f.key} style={{ marginBottom: 8 }}>
+              <label style={{ display: "block", fontSize: "0.78rem", color: TOKENS.inkSoft }}>{f.label}</label>
+              <input type="number" value={form[f.key]} onChange={(e) => setField(f.key, e.target.value)} style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} />
+            </div>
+          ))}
+        </div>
+        <div style={{ flex: 1, minWidth: 260, background: TOKENS.oosBg, padding: "1rem", borderRadius: 10 }}>
+          <div style={{ fontWeight: 600, marginBottom: 8 }}>المصروفات (إجمالى: {expenseTotal.toLocaleString()})</div>
+          {FINANCE_EXPENSE_FIELDS.map((f) => (
+            <div key={f.key} style={{ marginBottom: 8 }}>
+              <label style={{ display: "block", fontSize: "0.78rem", color: TOKENS.inkSoft }}>{f.label}</label>
+              <input type="number" value={form[f.key]} onChange={(e) => setField(f.key, e.target.value)} style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ ...cardStyle, marginTop: "1rem", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ fontWeight: 600 }}>صافى اليوم: {(revenueTotal - expenseTotal).toLocaleString()}</div>
+        <button onClick={submit} disabled={saving} style={primaryBtn}>
+          {saving ? "جاري الحفظ…" : "حفظ اليوم"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function FinanceExcelImportTab({ onSaveMany }) {
+  const fileInputRef = useRef(null);
+  const [sheetNames, setSheetNames] = useState([]);
+  const [workbook, setWorkbook] = useState(null);
+  const [selectedSheet, setSelectedSheet] = useState("");
+  const [headerRows, setHeaderRows] = useState([]); // raw rows 0..5 for column mapping
+  const [columnMap, setColumnMap] = useState({}); // colIndex -> target field key
+  const [dataStartRow, setDataStartRow] = useState(0);
+  const [month, setMonth] = useState(new Date().getMonth() + 1);
+  const [year, setYear] = useState(new Date().getFullYear());
+  const [previewRows, setPreviewRows] = useState([]);
+  const [saving, setSaving] = useState(false);
+  const [status, setStatus] = useState("");
+
+  const handleFile = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setStatus("جاري قراءة الملف…");
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const wb = XLSX.read(evt.target.result, { type: "binary", cellDates: true });
+        setWorkbook(wb);
+        setSheetNames(wb.SheetNames);
+        setSelectedSheet(wb.SheetNames[wb.SheetNames.length - 1]);
+        setStatus("");
+      } catch (err) {
+        setStatus(`❌ تعذرت قراءة الملف: ${err.message}`);
+      }
+    };
+    reader.readAsBinaryString(file);
+  };
+
+  // Whenever the chosen sheet changes, re-scan its header block and
+  // re-guess the column mapping.
+  useEffect(() => {
+    if (!workbook || !selectedSheet) return;
+    const ws = workbook.Sheets[selectedSheet];
+    const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: true });
+    const headerBlock = raw.slice(0, 6);
+    setHeaderRows(headerBlock);
+
+    const colCount = Math.max(0, ...headerBlock.map((r) => (r ? r.length : 0)));
+    const guessed = {};
+    for (let c = 0; c < colCount; c++) {
+      const combined = headerBlock.map((r) => (r && r[c] != null ? String(r[c]) : "")).filter(Boolean).join(" ");
+      guessed[c] = guessFinanceFieldForHeader(combined);
+    }
+    setColumnMap(guessed);
+
+    // Guess the first data row: the row right after the last non-empty header row.
+    let lastHeaderIdx = 0;
+    headerBlock.forEach((r, i) => {
+      if (r && r.some((cell) => cell !== null && cell !== "")) lastHeaderIdx = i;
+    });
+    setDataStartRow(lastHeaderIdx + 1);
+
+    // Guess month/year from a sheet name like "9-2025" or "9-2025 ".
+    const m = selectedSheet.match(/(\d{1,2})\s*-\s*(\d{4})/);
+    if (m) {
+      setMonth(Number(m[1]));
+      setYear(Number(m[2]));
+    }
+  }, [workbook, selectedSheet]);
+
+  const buildPreview = () => {
+    if (!workbook || !selectedSheet) return;
+    const ws = workbook.Sheets[selectedSheet];
+    const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: true });
+    const dateColIndex = Object.keys(columnMap).find((c) => columnMap[c] === "entry_date");
+
+    const built = [];
+    for (let r = dataStartRow; r < raw.length; r++) {
+      const row = raw[r] || [];
+      if (dateColIndex === undefined) continue;
+      const rawDateVal = row[dateColIndex];
+      if (rawDateVal === null || rawDateVal === undefined || rawDateVal === "") continue;
+
+      let entry_date;
+      if (rawDateVal instanceof Date) {
+        entry_date = rawDateVal.toISOString().slice(0, 10);
+      } else {
+        const day = Math.round(financeCleanNumber(rawDateVal));
+        if (!day || day < 1 || day > 31) continue;
+        entry_date = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+      }
+
+      const draft = emptyFinanceForm(entry_date);
+      draft.revenue_reported_total = "";
+      draft.expense_reported_total = "";
+      draft.balance_previous = "";
+      draft.balance_ending = "";
+      Object.entries(columnMap).forEach(([colIdx, target]) => {
+        if (target === "ignore" || target === "entry_date") return;
+        draft[target] = financeCleanNumber(row[Number(colIdx)]);
+      });
+      built.push(draft);
+    }
+    setPreviewRows(built);
+  };
+
+  const updatePreviewCell = (idx, key, value) => {
+    setPreviewRows((prev) => prev.map((r, i) => (i === idx ? { ...r, [key]: value === "" ? "" : Number(value) } : r)));
+  };
+
+  const saveAll = async () => {
+    setSaving(true);
+    const ok = await onSaveMany(previewRows);
+    setSaving(false);
+    if (ok) {
+      setStatus(`🎯 تم حفظ ${previewRows.length} يوم في قاعدة البيانات.`);
+      setPreviewRows([]);
+    }
+  };
+
+  return (
+    <div>
+      <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", marginBottom: "0.5rem" }}>Import from Excel</h2>
+      <div style={{ fontSize: "0.85rem", color: TOKENS.inkSoft, marginBottom: "1rem" }}>
+        ارفع ملف الشيت، اختر الشهر (تبويب) المطلوب، راجع تطابق الأعمدة، ثم راجع البيانات قبل الحفظ النهائى. أرقام فارغة أو
+        بصيغة علمية (زى 1E+05) بيتم تنظيفها تلقائياً.
+      </div>
+
+      <div style={{ ...cardStyle, marginBottom: "1rem" }}>
+        <input ref={fileInputRef} type="file" accept=".xlsx,.xls" onChange={handleFile} />
+        {status && <div style={{ marginTop: 8, fontSize: "0.85rem" }}>{status}</div>}
+      </div>
+
+      {sheetNames.length > 0 && (
+        <div style={{ ...cardStyle, marginBottom: "1rem" }}>
+          <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "0.75rem" }}>
+            <div>
+              <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, marginBottom: 4 }}>ورقة الشيت (الشهر)</div>
+              <select value={selectedSheet} onChange={(e) => setSelectedSheet(e.target.value)} style={inputStyle}>
+                {sheetNames.map((n) => (
+                  <option key={n} value={n}>{n}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, marginBottom: 4 }}>شهر التاريخ (لو العمود رقم يوم فقط)</div>
+              <input type="number" min="1" max="12" value={month} onChange={(e) => setMonth(Number(e.target.value))} style={{ ...inputStyle, width: 70 }} />
+            </div>
+            <div>
+              <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, marginBottom: 4 }}>السنة</div>
+              <input type="number" value={year} onChange={(e) => setYear(Number(e.target.value))} style={{ ...inputStyle, width: 90 }} />
+            </div>
+            <div>
+              <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, marginBottom: 4 }}>أول صف بيانات (رقم الصف، يبدأ من 0)</div>
+              <input type="number" min="0" value={dataStartRow} onChange={(e) => setDataStartRow(Number(e.target.value))} style={{ ...inputStyle, width: 90 }} />
+            </div>
+          </div>
+
+          <div style={{ fontWeight: 600, marginBottom: 6 }}>تطابق الأعمدة</div>
+          <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, marginBottom: 8 }}>
+            تم اقتراح التطابق تلقائياً حسب عناوين الأعمدة — راجعها وعدّل أي عمود غلط قبل المتابعة.
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 8, marginBottom: 8 }}>
+            {Object.keys(columnMap).map((c) => {
+              const headerText = headerRows.map((r) => (r && r[c] != null ? String(r[c]) : "")).filter(Boolean).join(" ").trim();
+              if (!headerText && columnMap[c] === "ignore") return null;
+              return (
+                <div key={c} style={{ border: `1px solid ${TOKENS.paperDim}`, borderRadius: 8, padding: "0.5rem" }}>
+                  <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft, marginBottom: 4 }}>
+                    عمود {c} — {headerText || "(بدون عنوان)"}
+                  </div>
+                  <select
+                    value={columnMap[c]}
+                    onChange={(e) => setColumnMap((prev) => ({ ...prev, [c]: e.target.value }))}
+                    style={{ ...inputStyle, width: "100%" }}
+                  >
+                    {FINANCE_MAP_TARGETS.map((t) => (
+                      <option key={t.value} value={t.value}>{t.label}</option>
+                    ))}
+                  </select>
+                </div>
+              );
+            })}
+          </div>
+
+          <button onClick={buildPreview} style={ghostBtn}>معاينة البيانات</button>
+        </div>
+      )}
+
+      {previewRows.length > 0 && (
+        <div style={cardStyle}>
+          <div style={{ fontWeight: 600, marginBottom: 8 }}>
+            معاينة {previewRows.length} يوم — راجع وعدّل أي رقم قبل الحفظ
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "0.75rem" }}>
+              <thead>
+                <tr>
+                  <th style={thStyle}>التاريخ</th>
+                  {FINANCE_REVENUE_FIELDS.map((f) => <th key={f.key} style={thStyle}>{f.label}</th>)}
+                  {FINANCE_EXPENSE_FIELDS.map((f) => <th key={f.key} style={thStyle}>{f.label}</th>)}
+                  <th style={thStyle}>إجمالى الإيراد (محسوب)</th>
+                  <th style={thStyle}>إجمالى المصروفات (محسوب)</th>
+                  <th style={thStyle}>إجمالى الإيراد (من الشيت)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {previewRows.map((r, i) => {
+                  const rev = financeRevenueTotal(r);
+                  const reported = r.revenue_reported_total;
+                  const mismatch = reported !== "" && reported !== undefined && Math.abs(Number(reported) - rev) > 1;
+                  return (
+                    <tr key={r.entry_date}>
+                      <td style={tdStyle}>{r.entry_date}</td>
+                      {FINANCE_REVENUE_FIELDS.map((f) => (
+                        <td style={tdStyle} key={f.key}>
+                          <input type="number" value={r[f.key]} onChange={(e) => updatePreviewCell(i, f.key, e.target.value)} style={{ ...inputStyle, width: 70, padding: "2px 4px" }} />
+                        </td>
+                      ))}
+                      {FINANCE_EXPENSE_FIELDS.map((f) => (
+                        <td style={tdStyle} key={f.key}>
+                          <input type="number" value={r[f.key]} onChange={(e) => updatePreviewCell(i, f.key, e.target.value)} style={{ ...inputStyle, width: 70, padding: "2px 4px" }} />
+                        </td>
+                      ))}
+                      <td style={tdStyle}>{rev.toLocaleString()}</td>
+                      <td style={tdStyle}>{financeExpenseTotal(r).toLocaleString()}</td>
+                      <td style={{ ...tdStyle, color: mismatch ? TOKENS.oos : TOKENS.inkSoft, fontWeight: mismatch ? 700 : 400 }}>
+                        {reported === "" || reported === undefined ? "—" : Number(reported).toLocaleString()}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <button onClick={saveAll} disabled={saving} style={{ ...primaryBtn, marginTop: 12 }}>
+            {saving ? "جاري الحفظ…" : `حفظ ${previewRows.length} يوم فى قاعدة البيانات`}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FinanceHistoryTab({ rows }) {
+  const chartRows = useMemo(() => [...rows].sort((a, b) => a.entry_date.localeCompare(b.entry_date)).slice(-31), [rows]);
+  const monthTotal = useMemo(() => {
+    const rev = chartRows.reduce((s, r) => s + (Number(r.revenue_total) || 0), 0);
+    const exp = chartRows.reduce((s, r) => s + (Number(r.expenses_total) || 0), 0);
+    return { rev, exp, net: rev - exp };
+  }, [chartRows]);
+
+  return (
+    <div>
+      <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", marginBottom: "0.5rem" }}>History & chart</h2>
+
+      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "1rem" }}>
+        <div style={{ ...cardStyle, flex: 1, minWidth: 160 }}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>إجمالى الإيرادات (آخر {chartRows.length} يوم)</div>
+          <div style={{ fontSize: "1.4rem", fontWeight: 700, color: TOKENS.clean }}>{monthTotal.rev.toLocaleString()}</div>
+        </div>
+        <div style={{ ...cardStyle, flex: 1, minWidth: 160 }}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>إجمالى المصروفات</div>
+          <div style={{ fontSize: "1.4rem", fontWeight: 700, color: TOKENS.oos }}>{monthTotal.exp.toLocaleString()}</div>
+        </div>
+        <div style={{ ...cardStyle, flex: 1, minWidth: 160 }}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>صافى الربح</div>
+          <div style={{ fontSize: "1.4rem", fontWeight: 700, color: monthTotal.net >= 0 ? TOKENS.clean : TOKENS.oos }}>{monthTotal.net.toLocaleString()}</div>
+        </div>
+      </div>
+
+      {chartRows.length > 0 ? (
+        <div style={{ ...cardStyle, marginBottom: "1rem" }}>
+          <FinanceLineChart rows={chartRows} />
+        </div>
+      ) : (
+        <div style={{ color: TOKENS.inkSoft, marginBottom: "1rem" }}>لا توجد بيانات محفوظة بعد.</div>
+      )}
+
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "0.8rem" }}>
+          <thead>
+            <tr>
+              <th style={thStyle}>التاريخ</th>
+              <th style={thStyle}>إجمالى الإيراد</th>
+              <th style={thStyle}>إجمالى المصروفات</th>
+              <th style={thStyle}>صافى اليوم</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.entry_date}>
+                <td style={tdStyle}>{r.entry_date}</td>
+                <td style={tdStyle}>{Number(r.revenue_total).toLocaleString()}</td>
+                <td style={tdStyle}>{Number(r.expenses_total).toLocaleString()}</td>
+                <td style={tdStyle}>{(Number(r.revenue_total) - Number(r.expenses_total)).toLocaleString()}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+const thStyle = { textAlign: "right", padding: "4px 8px", borderBottom: `1px solid ${TOKENS.paperDim}`, color: TOKENS.inkSoft, fontWeight: 600, whiteSpace: "nowrap" };
+const tdStyle = { textAlign: "right", padding: "4px 8px", borderBottom: `1px solid ${TOKENS.paperDim}`, whiteSpace: "nowrap" };
+
+// ---- Accountant report (manager-facing analysis of finance_daily) ----
+// Read-only for the manager: pulls the same finance_daily rows the
+// accountant enters/imports and turns them into an analyzed report —
+// totals, category breakdowns, month-over-month trend, best/worst days,
+// and a data-quality check against the accountant's own reported totals.
+function financeMonthKey(dateISO) {
+  return dateISO.slice(0, 7); // YYYY-MM
+}
+function financeMonthLabel(monthKey) {
+  const [y, m] = monthKey.split("-").map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString("en-GB", { month: "short", year: "numeric" });
+}
+
+function CategoryBarList({ title, fields, rows, color }) {
+  const totals = useMemo(() => {
+    const sums = fields.map((f) => ({
+      key: f.key,
+      label: f.label,
+      value: rows.reduce((s, r) => s + (Number(r[f.key]) || 0), 0),
+    }));
+    const grand = sums.reduce((s, f) => s + f.value, 0);
+    return { sums: sums.sort((a, b) => b.value - a.value), grand };
+  }, [fields, rows]);
+
+  return (
+    <div style={{ ...cardStyle, flex: 1, minWidth: 280 }}>
+      <div style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.75rem" }}>{title}</div>
+      {totals.grand <= 0 ? (
+        <div style={{ color: TOKENS.inkSoft, fontSize: "0.8rem" }}>لا توجد بيانات فى هذه الفترة.</div>
+      ) : (
+        totals.sums.map((f) => {
+          const pct = totals.grand > 0 ? (f.value / totals.grand) * 100 : 0;
+          return (
+            <div key={f.key} style={{ marginBottom: "0.5rem" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.78rem", marginBottom: 2 }}>
+                <span>{f.label}</span>
+                <span style={{ color: TOKENS.inkSoft }}>
+                  {f.value.toLocaleString()} ({pct.toFixed(1)}%)
+                </span>
+              </div>
+              <div style={{ background: TOKENS.paperDim, borderRadius: 4, height: 8, overflow: "hidden" }}>
+                <div style={{ width: `${pct}%`, background: color, height: "100%" }} />
+              </div>
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
+}
+
+function AccountantReportTab({ supabaseSession }) {
+  const [rows, setRows] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState("");
+  const [rangeStart, setRangeStart] = useState(addDaysISO(todayISO(), -30));
+  const [rangeEnd, setRangeEnd] = useState(todayISO());
+
+  const hotelId = supabaseSession && supabaseSession.hotelId;
+  const token = supabaseSession && supabaseSession.access_token;
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!hotelId) {
+        setLoaded(true);
+        return;
+      }
+      try {
+        const data = await supabaseRest(`finance_daily?hotel_id=eq.${hotelId}&order=entry_date.asc&limit=3000`, { accessToken: token });
+        if (!cancelled) setRows(data || []);
+      } catch (e) {
+        if (!cancelled) setError(`Couldn't load accountant data: ${e.message}`);
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [hotelId, token]);
+
+  const filteredRows = useMemo(
+    () => rows.filter((r) => r.entry_date >= rangeStart && r.entry_date <= rangeEnd).sort((a, b) => a.entry_date.localeCompare(b.entry_date)),
+    [rows, rangeStart, rangeEnd]
+  );
+
+  const stats = useMemo(() => {
+    const rev = filteredRows.reduce((s, r) => s + (Number(r.revenue_total) || 0), 0);
+    const exp = filteredRows.reduce((s, r) => s + (Number(r.expenses_total) || 0), 0);
+    const net = rev - exp;
+    const days = filteredRows.length;
+    const margin = rev > 0 ? (net / rev) * 100 : 0;
+    let bestDay = null;
+    let worstDay = null;
+    filteredRows.forEach((r) => {
+      const n = (Number(r.revenue_total) || 0) - (Number(r.expenses_total) || 0);
+      if (!bestDay || n > bestDay.net) bestDay = { entry_date: r.entry_date, net: n };
+      if (!worstDay || n < worstDay.net) worstDay = { entry_date: r.entry_date, net: n };
+    });
+    return {
+      rev,
+      exp,
+      net,
+      days,
+      margin,
+      avgRev: days ? rev / days : 0,
+      avgExp: days ? exp / days : 0,
+      avgNet: days ? net / days : 0,
+      bestDay,
+      worstDay,
+    };
+  }, [filteredRows]);
+
+  const monthly = useMemo(() => {
+    const byMonth = {};
+    filteredRows.forEach((r) => {
+      const key = financeMonthKey(r.entry_date);
+      if (!byMonth[key]) byMonth[key] = { rev: 0, exp: 0, days: 0 };
+      byMonth[key].rev += Number(r.revenue_total) || 0;
+      byMonth[key].exp += Number(r.expenses_total) || 0;
+      byMonth[key].days += 1;
+    });
+    const keys = Object.keys(byMonth).sort();
+    return keys.map((key, i) => {
+      const m = byMonth[key];
+      const net = m.rev - m.exp;
+      const prev = i > 0 ? byMonth[keys[i - 1]] : null;
+      const prevNet = prev ? prev.rev - prev.exp : null;
+      const growth = prevNet ? ((net - prevNet) / Math.abs(prevNet)) * 100 : null;
+      return { key, label: financeMonthLabel(key), ...m, net, growth };
+    });
+  }, [filteredRows]);
+
+  // Flags rows where the accountant's own sheet total doesn't match the
+  // sum of the category columns we computed — a data-entry / import issue
+  // worth the manager's attention, not just a display quirk.
+  const mismatches = useMemo(() => {
+    return filteredRows.filter((r) => {
+      const revMismatch = r.revenue_reported_total != null && Math.abs(Number(r.revenue_reported_total) - Number(r.revenue_total)) > 1;
+      const expMismatch = r.expense_reported_total != null && Math.abs(Number(r.expense_reported_total) - Number(r.expenses_total)) > 1;
+      return revMismatch || expMismatch;
+    });
+  }, [filteredRows]);
+
+  const exportToExcel = () => {
+    const sheetRows = filteredRows.map((r) => ({
+      "التاريخ": r.entry_date,
+      "الغرف": r.revenue_rooms,
+      "الكوفى شوب": r.revenue_coffee_shop,
+      "بار / حمام السباحة": r.revenue_pool_bar,
+      "الشاطئ": r.revenue_beach,
+      "إيجارات": r.revenue_rentals,
+      "إيرادات أخرى": r.revenue_other,
+      "إجمالى الإيراد": r.revenue_total,
+      "مصاريف تشغيل": r.expense_operating,
+      "مرتبات": r.expense_salaries,
+      "جارى الشريك": r.expense_partner_current,
+      "إيداع البنك": r.expense_bank_deposit,
+      "سلف الأسطاف": r.expense_staff_advances,
+      "مصاريف ثابتة": r.expense_fixed,
+      "مصاريف أخرى": r.expense_other,
+      "إجمالى المصروفات": r.expenses_total,
+      "صافى اليوم": (Number(r.revenue_total) || 0) - (Number(r.expenses_total) || 0),
+    }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(sheetRows), "Daily");
+    XLSX.utils.book_append_sheet(
+      wb,
+      XLSX.utils.json_to_sheet(
+        monthly.map((m) => ({ "الشهر": m.label, "الإيراد": m.rev, "المصروفات": m.exp, "الصافى": m.net, "أيام مسجلة": m.days }))
+      ),
+      "Monthly"
+    );
+    XLSX.writeFile(wb, `accountant-report_${rangeStart}_to_${rangeEnd}.xlsx`);
+  };
+
+  if (!loaded) return <div style={{ color: TOKENS.inkSoft }}>Loading…</div>;
+
+  if (!hotelId) {
+    return <div style={{ color: TOKENS.inkSoft }}>Sign in with a real manager account to view the accountant report.</div>;
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "0.75rem", marginBottom: "0.75rem" }}>
+        <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", margin: 0 }}>Accountant report</h2>
+        <button
+          onClick={exportToExcel}
+          disabled={!filteredRows.length}
+          style={{
+            background: TOKENS.ink,
+            color: TOKENS.paper,
+            border: "none",
+            borderRadius: 8,
+            padding: "0.5rem 1rem",
+            fontSize: "0.8rem",
+            cursor: filteredRows.length ? "pointer" : "not-allowed",
+            opacity: filteredRows.length ? 1 : 0.5,
+          }}
+        >
+          تصدير Excel
+        </button>
+      </div>
+
+      {error && <div style={{ background: TOKENS.oosBg, color: TOKENS.oos, padding: "0.5rem 1rem", borderRadius: 8, fontSize: "0.85rem", marginBottom: "0.75rem" }}>{error}</div>}
+
+      <div style={{ ...cardStyle, display: "flex", gap: "1rem", flexWrap: "wrap", alignItems: "flex-end", marginBottom: "1rem" }}>
+        <label style={{ display: "flex", flexDirection: "column", fontSize: "0.75rem", color: TOKENS.inkSoft, gap: 4 }}>
+          من تاريخ
+          <input type="date" value={rangeStart} max={rangeEnd} onChange={(e) => setRangeStart(e.target.value)} style={{ padding: "0.4rem", borderRadius: 6, border: `1px solid ${TOKENS.paperDim}` }} />
+        </label>
+        <label style={{ display: "flex", flexDirection: "column", fontSize: "0.75rem", color: TOKENS.inkSoft, gap: 4 }}>
+          إلى تاريخ
+          <input type="date" value={rangeEnd} min={rangeStart} onChange={(e) => setRangeEnd(e.target.value)} style={{ padding: "0.4rem", borderRadius: 6, border: `1px solid ${TOKENS.paperDim}` }} />
+        </label>
+        <div style={{ display: "flex", gap: "0.4rem" }}>
+          {[
+            { label: "7d", days: 7 },
+            { label: "30d", days: 30 },
+            { label: "90d", days: 90 },
+          ].map((p) => (
+            <button
+              key={p.label}
+              onClick={() => {
+                setRangeEnd(todayISO());
+                setRangeStart(addDaysISO(todayISO(), -p.days));
+              }}
+              style={{ border: `1px solid ${TOKENS.paperDim}`, background: "#fff", borderRadius: 6, padding: "0.3rem 0.6rem", fontSize: "0.75rem", cursor: "pointer" }}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+        <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>{stats.days} يوم مسجل فى هذه الفترة</div>
+      </div>
+
+      {/* Top-line summary */}
+      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "1rem" }}>
+        <div style={{ ...cardStyle, flex: 1, minWidth: 150 }}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>إجمالى الإيرادات</div>
+          <div style={{ fontSize: "1.4rem", fontWeight: 700, color: TOKENS.clean }}>{stats.rev.toLocaleString()}</div>
+        </div>
+        <div style={{ ...cardStyle, flex: 1, minWidth: 150 }}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>إجمالى المصروفات</div>
+          <div style={{ fontSize: "1.4rem", fontWeight: 700, color: TOKENS.oos }}>{stats.exp.toLocaleString()}</div>
+        </div>
+        <div style={{ ...cardStyle, flex: 1, minWidth: 150 }}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>صافى الربح</div>
+          <div style={{ fontSize: "1.4rem", fontWeight: 700, color: stats.net >= 0 ? TOKENS.clean : TOKENS.oos }}>{stats.net.toLocaleString()}</div>
+        </div>
+        <div style={{ ...cardStyle, flex: 1, minWidth: 150 }}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>هامش الربح</div>
+          <div style={{ fontSize: "1.4rem", fontWeight: 700, color: stats.margin >= 0 ? TOKENS.clean : TOKENS.oos }}>{stats.margin.toFixed(1)}%</div>
+        </div>
+      </div>
+
+      {/* Averages + best/worst */}
+      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "1rem" }}>
+        <div style={{ ...cardStyle, flex: 1, minWidth: 200 }}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft, marginBottom: 4 }}>متوسط اليوم</div>
+          <div style={{ fontSize: "0.85rem" }}>إيراد: {stats.avgRev.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+          <div style={{ fontSize: "0.85rem" }}>مصروف: {stats.avgExp.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+          <div style={{ fontSize: "0.85rem" }}>صافى: {stats.avgNet.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
+        </div>
+        <div style={{ ...cardStyle, flex: 1, minWidth: 200 }}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft, marginBottom: 4 }}>أفضل يوم (صافى)</div>
+          {stats.bestDay ? (
+            <div style={{ fontSize: "0.9rem", color: TOKENS.clean, fontWeight: 600 }}>
+              {stats.bestDay.entry_date} — {stats.bestDay.net.toLocaleString()}
+            </div>
+          ) : (
+            <div style={{ color: TOKENS.inkSoft, fontSize: "0.8rem" }}>—</div>
+          )}
+        </div>
+        <div style={{ ...cardStyle, flex: 1, minWidth: 200 }}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft, marginBottom: 4 }}>أضعف يوم (صافى)</div>
+          {stats.worstDay ? (
+            <div style={{ fontSize: "0.9rem", color: stats.worstDay.net < 0 ? TOKENS.oos : TOKENS.ink, fontWeight: 600 }}>
+              {stats.worstDay.entry_date} — {stats.worstDay.net.toLocaleString()}
+            </div>
+          ) : (
+            <div style={{ color: TOKENS.inkSoft, fontSize: "0.8rem" }}>—</div>
+          )}
+        </div>
+      </div>
+
+      {/* Trend chart */}
+      {filteredRows.length > 0 ? (
+        <div style={{ ...cardStyle, marginBottom: "1rem" }}>
+          <div style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>الإيراد والمصروف اليومى</div>
+          <FinanceLineChart rows={filteredRows} />
+        </div>
+      ) : (
+        <div style={{ color: TOKENS.inkSoft, marginBottom: "1rem" }}>لا توجد بيانات محفوظة فى هذه الفترة.</div>
+      )}
+
+      {/* Category breakdown */}
+      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "1rem" }}>
+        <CategoryBarList title="الإيرادات حسب المصدر" fields={FINANCE_REVENUE_FIELDS} rows={filteredRows} color={TOKENS.clean} />
+        <CategoryBarList title="المصروفات حسب النوع" fields={FINANCE_EXPENSE_FIELDS} rows={filteredRows} color={TOKENS.oos} />
+      </div>
+
+      {/* Monthly comparison */}
+      {monthly.length > 0 && (
+        <div style={{ ...cardStyle, marginBottom: "1rem", overflowX: "auto" }}>
+          <div style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>مقارنة شهرية</div>
+          <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "0.8rem" }}>
+            <thead>
+              <tr>
+                <th style={thStyle}>الشهر</th>
+                <th style={thStyle}>الإيراد</th>
+                <th style={thStyle}>المصروفات</th>
+                <th style={thStyle}>الصافى</th>
+                <th style={thStyle}>التغيير عن الشهر السابق</th>
+              </tr>
+            </thead>
+            <tbody>
+              {monthly.map((m) => (
+                <tr key={m.key}>
+                  <td style={tdStyle}>{m.label}</td>
+                  <td style={tdStyle}>{m.rev.toLocaleString()}</td>
+                  <td style={tdStyle}>{m.exp.toLocaleString()}</td>
+                  <td style={{ ...tdStyle, color: m.net >= 0 ? TOKENS.clean : TOKENS.oos, fontWeight: 600 }}>{m.net.toLocaleString()}</td>
+                  <td style={tdStyle}>
+                    {m.growth === null ? "—" : `${m.growth >= 0 ? "+" : ""}${m.growth.toFixed(1)}%`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Data quality flags */}
+      {mismatches.length > 0 && (
+        <div style={{ ...cardStyle, marginBottom: "1rem", border: `1px solid ${TOKENS.oos}` }}>
+          <div style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem", color: TOKENS.oos }}>
+            تنبيه: {mismatches.length} يوم بإجمالى مُدخل لا يطابق مجموع البنود
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "0.78rem" }}>
+              <thead>
+                <tr>
+                  <th style={thStyle}>التاريخ</th>
+                  <th style={thStyle}>إيراد محسوب</th>
+                  <th style={thStyle}>إيراد مُدخل بالشيت</th>
+                  <th style={thStyle}>مصروف محسوب</th>
+                  <th style={thStyle}>مصروف مُدخل بالشيت</th>
+                </tr>
+              </thead>
+              <tbody>
+                {mismatches.map((r) => (
+                  <tr key={r.entry_date}>
+                    <td style={tdStyle}>{r.entry_date}</td>
+                    <td style={tdStyle}>{Number(r.revenue_total).toLocaleString()}</td>
+                    <td style={tdStyle}>{r.revenue_reported_total != null ? Number(r.revenue_reported_total).toLocaleString() : "—"}</td>
+                    <td style={tdStyle}>{Number(r.expenses_total).toLocaleString()}</td>
+                    <td style={tdStyle}>{r.expense_reported_total != null ? Number(r.expense_reported_total).toLocaleString() : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Daily detail */}
+      <div style={{ ...cardStyle, overflowX: "auto" }}>
+        <div style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>التفاصيل اليومية</div>
+        <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "0.8rem" }}>
+          <thead>
+            <tr>
+              <th style={thStyle}>التاريخ</th>
+              <th style={thStyle}>إجمالى الإيراد</th>
+              <th style={thStyle}>إجمالى المصروفات</th>
+              <th style={thStyle}>صافى اليوم</th>
+            </tr>
+          </thead>
+          <tbody>
+            {[...filteredRows].reverse().map((r) => (
+              <tr key={r.entry_date}>
+                <td style={tdStyle}>{r.entry_date}</td>
+                <td style={tdStyle}>{Number(r.revenue_total).toLocaleString()}</td>
+                <td style={tdStyle}>{Number(r.expenses_total).toLocaleString()}</td>
+                <td style={{ ...tdStyle, color: (Number(r.revenue_total) - Number(r.expenses_total)) >= 0 ? TOKENS.clean : TOKENS.oos }}>
+                  {(Number(r.revenue_total) - Number(r.expenses_total)).toLocaleString()}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function UsersTab({ extraUsers, onAddUser, onDeleteUser, supabaseSession }) {
   const [form, setForm] = useState({ email: "", displayName: "", password: "", role: "reception" });
   const [formError, setFormError] = useState("");
@@ -4275,7 +4904,8 @@ function UsersTab({ extraUsers, onAddUser, onDeleteUser, supabaseSession }) {
       setFormError(result.error);
       return;
     }
-    const accessLabel = form.role === "analyst" ? "view-only analytics access" : "reception access";
+    const accessLabel =
+      form.role === "analyst" ? "view-only analytics access" : form.role === "accountant" ? "accountant (daily finance entry) access" : "reception access";
     setFormNote(`"${form.displayName.trim()}" can now sign in with ${accessLabel} using ${form.email.trim()}.`);
     setForm({ email: "", displayName: "", password: "", role: form.role });
   };
@@ -4290,9 +4920,10 @@ function UsersTab({ extraUsers, onAddUser, onDeleteUser, supabaseSession }) {
     <div>
       <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", marginBottom: "0.5rem" }}>Users</h2>
       <div style={{ fontSize: "0.85rem", color: TOKENS.inkSoft, marginBottom: "1rem" }}>
-        Add staff accounts with one of two access levels: reception (Rooms, Bookings, Guests, Housekeeping, Tickets —
-        same as the main reception login) or analytics view-only (sees the Analytics page but can't delete any
-        records, add users, or edit pricing).
+        Add staff accounts with one of three access levels: reception (Rooms, Bookings, Guests, Housekeeping, Tickets —
+        same as the main reception login), analytics view-only (sees the Analytics page but can't delete any
+        records, add users, or edit pricing), or accountant (daily revenue/expense entry — by form or Excel upload —
+        with no access to rooms, bookings, or guest data).
       </div>
 
       {!supabaseSession && (
@@ -4341,6 +4972,12 @@ function UsersTab({ extraUsers, onAddUser, onDeleteUser, supabaseSession }) {
           >
             Analytics (view only)
           </button>
+          <button
+            onClick={() => setForm({ ...form, role: "accountant" })}
+            style={{ ...ghostBtn, flex: 1, background: form.role === "accountant" ? TOKENS.paperDim : "#fff" }}
+          >
+            Accountant
+          </button>
         </div>
         {formError && (
           <div style={{ fontSize: "0.8rem", color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginBottom: 8 }}>
@@ -4369,7 +5006,13 @@ function UsersTab({ extraUsers, onAddUser, onDeleteUser, supabaseSession }) {
               <div>
                 <div style={{ fontWeight: 600 }}>{u.username}</div>
                 <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft }}>
-                  {u.role === "analyst" ? "Analytics access (view only)" : u.role === "manager" ? "Manager access" : "Reception access"}
+                  {u.role === "analyst"
+                    ? "Analytics access (view only)"
+                    : u.role === "manager"
+                    ? "Manager access"
+                    : u.role === "accountant"
+                    ? "Accountant access (daily finance entry)"
+                    : "Reception access"}
                 </div>
               </div>
               <button onClick={() => remove(u.id)} disabled={removingId === u.id} style={ghostBtn}>
@@ -4555,7 +5198,15 @@ function SystemLoginGate() {
         if (staffRow) {
           setSupabaseSession({ ...session, hotelId: staffRow.hotel_id });
           setLoggedInUsername(staffRow.display_name || typedUsername);
-          setRole(staffRow.role === "analyst" ? "analyst" : staffRow.role === "manager" ? "manager" : "reception");
+          setRole(
+            staffRow.role === "analyst"
+              ? "analyst"
+              : staffRow.role === "manager"
+              ? "manager"
+              : staffRow.role === "accountant"
+              ? "accountant"
+              : "reception"
+          );
           setLoginError("");
           return;
         }

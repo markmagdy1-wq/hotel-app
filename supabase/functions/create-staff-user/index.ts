@@ -76,7 +76,7 @@ Deno.serve(async (req) => {
     if (password.length < 8) {
       return json({ error: "Password must be at least 8 characters." }, 400);
     }
-    if (!["reception", "manager", "analyst"].includes(role)) {
+    if (!["reception", "manager", "analyst", "accountant"].includes(role)) {
       return json({ error: "Invalid role." }, 400);
     }
 
