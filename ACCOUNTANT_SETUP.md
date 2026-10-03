@@ -37,7 +37,19 @@
    Supabase account → **Users** tab → fill in name/email/password → pick
    **Accountant** → Add user.
 
-## Using the Excel import
+## What's new (update 2)
+- **Export button** on the Accountant console's History & chart tab: pick a
+  from/to date range and it downloads an `.xlsx` file in the same
+  column layout as your original monthly sheets.
+- **"جارى الشريك" split into 4 columns** — one per partner (م. مجدى، م. محب،
+  م. بولا، م. كاميل) — in the daily entry form, the Excel import mapping,
+  and the export.
+- If you already ran the original `finance_setup.sql`, run
+  `supabase/migrate_partner_split.sql` once to add the 4 new columns (it
+  best-effort copies any old combined amounts into "م. محب" — go back and
+  redistribute those by hand since the old column mixed partners together).
+  If you're setting up fresh, just run the updated `finance_setup.sql`.
+
 Your monthly sheets don't all put columns in the same order (I checked —
 January has extra balance/beach columns that September doesn't). So instead
 of a blind fixed mapping, the import tab:

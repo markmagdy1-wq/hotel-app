@@ -16,7 +16,10 @@ const FINANCE_REVENUE_FIELDS = [
 const FINANCE_EXPENSE_FIELDS = [
   { key: "expense_operating", label: "مصاريف تشغيل" },
   { key: "expense_salaries", label: "مرتبات" },
-  { key: "expense_partner_current", label: "جارى الشريك" },
+  { key: "expense_partner_magdy", label: "جارى الشريك - م. مجدى" },
+  { key: "expense_partner_moheb", label: "جارى الشريك - م. محب" },
+  { key: "expense_partner_bola", label: "جارى الشريك - م. بولا" },
+  { key: "expense_partner_kamel", label: "جارى الشريك - م. كاميل" },
   { key: "expense_bank_deposit", label: "إيداع البنك" },
   { key: "expense_staff_advances", label: "سلف الأسطاف" },
   { key: "expense_fixed", label: "مصاريف ثابتة" },
@@ -56,7 +59,12 @@ const FINANCE_HEADER_ALIASES = [
   { target: "revenue_reported_total", tests: ["اجمالى الايراد", "إجمالى الإيراد"] },
   { target: "expense_operating", tests: ["تشغيل"] },
   { target: "expense_salaries", tests: ["مرتبات"] },
-  { target: "expense_partner_current", tests: ["جارى الشريك", "جاري الشريك"] },
+  // NOTE: the old sheets store "جارى الشريك" as ONE combined column (partner
+  // name written as text + one amount) rather than one column per partner,
+  // so it can't be auto-mapped reliably — left out on purpose. During
+  // import, either map that column manually to a single partner if the
+  // whole day's amount was for one partner, or leave it ignored and split
+  // it across partners by hand afterward.
   { target: "expense_bank_deposit", tests: ["ايداع البنك", "إيداع البنك"] },
   { target: "expense_staff_advances", tests: ["سلف"] },
   { target: "expense_fixed", tests: ["م. ثابته", "ثابته", "ثابتة"] },
@@ -83,6 +91,7 @@ const FINANCE_MAP_TARGETS = [
   { value: "balance_previous", label: "الرصيد السابق (مرجعي)" },
   { value: "balance_ending", label: "الرصيد النهائى (مرجعي)" },
 ];
+
 
 const TOKENS = {
   ink: "#1B2430",
@@ -122,8 +131,18 @@ const BOOKING_TYPES = [
   { key: "booking", label: "Booking.com", color: "#003580", bg: "#DCE6F5" },
   { key: "airbnb", label: "Airbnb", color: "#FF385C", bg: "#FCE1E6" },
   { key: "syndicate", label: "نقابات", color: "#8C6A4F", bg: "#EFE6DB" },
+  { key: "sun", label: "SUN", color: "#0F766E", bg: "#D5EEEB" },
   { key: "other", label: "Others", color: "#6B7280", bg: "#E7E9EC" },
 ];
+const PAYMENT_METHODS = [
+  { key: "online", label: "Online" },
+  { key: "on_arrival", label: "الدفع عند الوصول" },
+  { key: "company", label: "الدفع مع الشركة" },
+];
+function paymentMethodLabel(key) {
+  const m = PAYMENT_METHODS.find((x) => x.key === key);
+  return m ? m.label : "";
+}
 const BOOKING_TYPE_FILTERS = [{ key: "all", label: "All" }, ...BOOKING_TYPES];
 function bookingTypeMeta(key) {
   return BOOKING_TYPES.find((t) => t.key === key) || BOOKING_TYPES[BOOKING_TYPES.length - 1];
@@ -176,6 +195,107 @@ async function supabaseRest(path, { accessToken, method = "GET", body, headers =
   }
   if (res.status === 204) return null;
   return res.json();
+}
+
+// PATCH that fails loudly. When Row Level Security blocks an UPDATE, Supabase
+// answers 200 with an empty array instead of an error, so the app used to think
+// the save worked while nothing reached the database.
+async function supabasePatchChecked(path, { accessToken, body, what }) {
+  const rows = await supabaseRest(path, { accessToken, method: "PATCH", body });
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error(
+      `${what || "Update"} was not saved to the database (0 rows changed). ` +
+        `Most likely a missing UPDATE permission (RLS policy) — run supabase/edit_switch_policies.sql in the Supabase SQL editor.`
+    );
+  }
+  return rows;
+}
+
+// How many rows we pull eagerly at login for the tables that only ever grow
+// (one row per ticket / maintenance entry, forever). Reception's "recent
+// tickets" list and the room-activity view only need a recent slice on first
+// paint — everything older is fetched on demand, paginated, by the tab that
+// actually needs it (see fetchTicketsPage below).
+const INITIAL_TICKETS_LIMIT = 50;
+const INITIAL_MAINTENANCE_LIMIT = 100;
+const TICKETS_PAGE_SIZE = 10;
+
+// True offset-based pagination against PostgREST (Supabase's REST layer).
+// PostgREST returns the total row count in the Content-Range header when we
+// ask for it via `Prefer: count=exact`, which is what lets us show
+// "Page X of Y" / disable the Next button without a second round trip.
+async function fetchTicketsPage({ accessToken, hotelId, rangeStart, rangeEndExclusive, page = 0, pageSize = TICKETS_PAGE_SIZE }) {
+  const offset = page * pageSize;
+  const res = await fetch(
+    `${SUPABASE_URL}/rest/v1/tickets?hotel_id=eq.${hotelId}&ticket_date=gte.${rangeStart}&ticket_date=lt.${rangeEndExclusive}` +
+      `&order=ticket_date.desc&limit=${pageSize}&offset=${offset}`,
+    {
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${accessToken || SUPABASE_ANON_KEY}`,
+        Prefer: "count=exact",
+      },
+    }
+  );
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Supabase error ${res.status}: ${errText}`);
+  }
+  const rows = await res.json();
+  // Content-Range looks like "0-9/137" — the part after "/" is the total count.
+  const contentRange = res.headers.get("content-range") || "";
+  const total = Number(contentRange.split("/")[1]) || rows.length;
+  return { rows: rows.map(mapTicketFromDb), total, page, pageSize };
+}
+
+// Lightweight aggregate for the "Tickets sold / Persons / Revenue" summary
+// cards. We only ask Postgres for the two numeric columns we need to sum, for
+// tickets *inside the selected range* — not the whole table, and not the
+// full ticket rows. This keeps the totals accurate across the whole range
+// even though the list below it is paginated 10-at-a-time.
+async function fetchTicketsRangeTotals({ accessToken, hotelId, rangeStart, rangeEndExclusive }) {
+  const rows = await supabaseRest(
+    `tickets?hotel_id=eq.${hotelId}&ticket_date=gte.${rangeStart}&ticket_date=lt.${rangeEndExclusive}&select=persons,amount_paid`,
+    { accessToken }
+  );
+  return (rows || []).reduce(
+    (acc, r) => ({ count: acc.count + 1, persons: acc.persons + (r.persons || 0), revenue: acc.revenue + Number(r.amount_paid || 0) }),
+    { count: 0, persons: 0, revenue: 0 }
+  );
+}
+
+// Bookings that overlap a date window, fetched straight from Supabase instead
+// of filtered out of the full (unbounded, ever-growing) bookings array. Two
+// bookings "overlap" [rangeStart, rangeEndExclusive) when the booking starts
+// before the window ends AND ends after the window starts — the standard
+// interval-overlap test — which PostgREST expresses as two chained filters.
+// This is what keeps Analytics's workload bounded by "how much happened in
+// the selected range" instead of "how many bookings the hotel has ever had".
+async function fetchBookingsOverlappingRange({ accessToken, hotelId, rangeStart, rangeEndExclusive, roomNumberById }) {
+  const rows = await supabaseRest(
+    `bookings?hotel_id=eq.${hotelId}&check_in=lt.${rangeEndExclusive}&check_out=gt.${rangeStart}&order=check_in`,
+    { accessToken }
+  );
+  return (rows || []).map((b) => mapBookingFromDb(b, roomNumberById));
+}
+
+// Rooms checking in or checking out on one exact date, for the Today Report's
+// "select a day" view. Two narrow equality filters (check_in=eq.<date> /
+// check_out=eq.<date>) instead of scanning the whole bookings history — the
+// query cost stays flat no matter how long the hotel has been operating.
+async function fetchCheckInsOnDate({ accessToken, hotelId, date, roomNumberById }) {
+  const rows = await supabaseRest(
+    `bookings?hotel_id=eq.${hotelId}&check_in=eq.${date}&status=neq.cancelled&order=room_id`,
+    { accessToken }
+  );
+  return (rows || []).map((b) => mapBookingFromDb(b, roomNumberById));
+}
+async function fetchCheckOutsOnDate({ accessToken, hotelId, date, roomNumberById }) {
+  const rows = await supabaseRest(
+    `bookings?hotel_id=eq.${hotelId}&check_out=eq.${date}&status=neq.cancelled&order=room_id`,
+    { accessToken }
+  );
+  return (rows || []).map((b) => mapBookingFromDb(b, roomNumberById));
 }
 
 async function supabaseFunctionCall(fnName, accessToken, payload) {
@@ -321,6 +441,7 @@ function rangesOverlap(startA, endA, startB, endB) {
 }
 
 function findConflict(allBookings, roomNumber, checkIn, checkOut, excludeBookingId) {
+  if (!roomNumber) return undefined; // booking with no room yet never clashes
   return allBookings.find(
     (b) =>
       b.roomNumber === roomNumber &&
@@ -363,7 +484,7 @@ function monthLabel(year, month) {
 
 const WEEKDAY_LABELS = ["S", "M", "T", "W", "T", "F", "S"];
 
-function MonthCalendar({ year, month, onMonthChange, highlightedDates, todayIso, onDayClick, selectedDate, legendLabel, rangeStart, rangeEnd }) {
+function MonthCalendar({ year, month, onMonthChange, highlightedDates, todayIso, onDayClick, selectedDate, legendLabel, rangeStart, rangeEnd, showLegend = true }) {
   const pad = (n) => String(n).padStart(2, "0");
   const isoFor = (d) => `${year}-${pad(month + 1)}-${pad(d)}`;
   const numDays = new Date(year, month + 1, 0).getDate();
@@ -472,7 +593,7 @@ function MonthCalendar({ year, month, onMonthChange, highlightedDates, todayIso,
         })}
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginTop: 12, paddingTop: 10, borderTop: `1px solid ${TOKENS.paperDim}`, fontSize: "0.68rem", color: TOKENS.inkSoft }}>
-        {(rangeStart !== undefined || rangeEnd !== undefined) ? (
+        {!showLegend ? null : (rangeStart !== undefined || rangeEnd !== undefined) ? (
           <>
             <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
               <span style={{ width: 10, height: 10, borderRadius: "50%", background: TOKENS.reserved, display: "inline-block" }} />
@@ -512,6 +633,32 @@ function mealPlanSurcharge(mealPlans, mealPlanRates) {
 const FONT_LINK = "https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap";
 
 // ---- Supabase row <-> local UI object mapping ----
+// Room-switch reasons are stored inside the guest's `notes` column, one line per
+// switch:  [switch:<bookingId>] 2026-10-03 · Room 201 → 105 · reason
+// Everything else in `notes` is the guest's normal free-text note.
+const SWITCH_NOTE_RE = /^\[switch:([^\]]+)\]\s*(.*)$/;
+function splitGuestNotes(notes) {
+  const plain = [];
+  const switches = {};
+  String(notes || "")
+    .split("\n")
+    .forEach((line) => {
+      const m = line.match(SWITCH_NOTE_RE);
+      if (m) (switches[m[1]] = switches[m[1]] || []).push(m[2]);
+      else if (line.trim()) plain.push(line);
+    });
+  return { plain: plain.join("\n"), switches };
+}
+function appendSwitchNote(notes, bookingId, text) {
+  const base = String(notes || "").replace(/\s+$/, "");
+  const line = `[switch:${bookingId}] ${text.replace(/\s*\n\s*/g, " ")}`;
+  return base ? `${base}\n${line}` : line;
+}
+
+function roomLabel(n) {
+  return n ? `Room ${n}` : "No room yet";
+}
+
 function mapRoomFromDb(r) {
   return {
     id: r.id,
@@ -547,6 +694,7 @@ function mapBookingFromDb(b, roomNumberById) {
     mealPlans: b.meal_plans || [],
     status: b.status,
     bookingType: b.booking_type || "booking",
+    paymentMethod: b.payment_method || "",
     discountPercent: Number(b.discount) || 0,
     totalAmount: Number(b.total_amount) || 0,
     createdBy: b.created_by,
@@ -578,7 +726,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
   const [mealPlanRates, setMealPlanRates] = useState(MEAL_PLAN_RATES);
   const [extraUsers, setExtraUsers] = useState([]);
   const [tab, setTab] = useState("rooms");
-  const [managerTab, setManagerTab] = useState("analytics");
+  const [managerTab, setManagerTab] = useState("home");
   const [selectedRoom, setSelectedRoom] = useState(null);
   const [showNewBooking, setShowNewBooking] = useState(false);
   const [showNewGuest, setShowNewGuest] = useState(false);
@@ -603,8 +751,12 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             supabaseRest(`rooms?hotel_id=eq.${hid}&order=number`, { accessToken: token }),
             supabaseRest(`guests?hotel_id=eq.${hid}&order=name`, { accessToken: token }),
             supabaseRest(`bookings?hotel_id=eq.${hid}&order=check_in`, { accessToken: token }),
-            supabaseRest(`tickets?hotel_id=eq.${hid}&order=ticket_date.desc`, { accessToken: token }),
-            supabaseRest(`maintenance_log?hotel_id=eq.${hid}`, { accessToken: token }),
+            // Bounded on purpose: the manager/reception tabs only ever show a handful of
+            // recent tickets on first paint (see TicketsTab). Historical ranges beyond this
+            // window are fetched on demand by TicketRecordsTab/AnalyticsDashboard instead of
+            // pulling the entire, ever-growing tickets table on every login.
+            supabaseRest(`tickets?hotel_id=eq.${hid}&order=ticket_date.desc&limit=${INITIAL_TICKETS_LIMIT}`, { accessToken: token }),
+            supabaseRest(`maintenance_log?hotel_id=eq.${hid}&order=logged_date.desc&limit=${INITIAL_MAINTENANCE_LIMIT}`, { accessToken: token }),
             supabaseRest(`room_rates?hotel_id=eq.${hid}`, { accessToken: token }),
             supabaseRest(`meal_plan_rates?hotel_id=eq.${hid}`, { accessToken: token }),
           ]);
@@ -950,6 +1102,10 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
   const checkIn = async (bookingId) => {
     const booking = bookings.find((b) => b.id === bookingId);
     if (!booking) return;
+    if (!booking.roomNumber) {
+      flashError("Choose a room for this booking first (Edit), then check in.");
+      return;
+    }
     if (supabaseSession) {
       try {
         await supabaseRest(`bookings?id=eq.${bookingId}`, {
@@ -1039,6 +1195,117 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
     updateBookings(nextBookings);
   };
 
+  // Edit a reservation / in-house stay: booking fields + the guest's own data.
+  const updateBooking = async (bookingId, fields, guestPatch) => {
+    const booking = bookings.find((b) => b.id === bookingId);
+    if (!booking) return;
+    const newRoomNumber = fields.roomNumber !== undefined ? fields.roomNumber : booking.roomNumber;
+    const merged = { ...booking, ...fields, roomNumber: newRoomNumber, roomId: (rooms.find((r) => r.number === newRoomNumber) || {}).id || null, partySize: fields.persons ?? booking.persons };
+    if (supabaseSession) {
+      try {
+        const token = supabaseSession.access_token;
+        if (guestPatch) {
+          await supabasePatchChecked(`guests?id=eq.${booking.guestId}`, {
+            accessToken: token,
+            what: "Guest data",
+            body: {
+              name: guestPatch.name,
+              phone: guestPatch.phone || null,
+              email: guestPatch.email || null,
+              national_id: guestPatch.nationalId || null,
+            },
+          });
+          setGuests((gs) => gs.map((g) => (g.id === booking.guestId ? { ...g, ...guestPatch } : g)));
+        }
+        const body = {
+          check_in: merged.checkIn,
+          check_out: merged.checkOut,
+          persons: merged.persons,
+          meal_plans: merged.mealPlans || [],
+          booking_type: merged.bookingType,
+          payment_method: merged.paymentMethod || null,
+          discount: merged.discountPercent || 0,
+          total_amount: merged.totalAmount || 0,
+        };
+        if (newRoomNumber !== booking.roomNumber) {
+          const room = rooms.find((r) => r.number === newRoomNumber);
+          body.room_id = room ? room.id : null;
+        }
+        await supabasePatchChecked(`bookings?id=eq.${bookingId}`, { accessToken: token, body, what: "Booking changes" });
+        setBookings((bs) => bs.map((b) => (b.id === bookingId ? merged : b)));
+      } catch (e) {
+        flashError(`Couldn't save changes: ${e.message}`);
+      }
+      return;
+    }
+    const nextGuests = guestPatch ? guests.map((g) => (g.id === booking.guestId ? { ...g, ...guestPatch } : g)) : guests;
+    const nextBookings = bookings.map((b) => (b.id === bookingId ? merged : b));
+    setGuests(nextGuests);
+    setBookings(nextBookings);
+    persist({ guests: nextGuests, bookings: nextBookings });
+  };
+
+  // Move an in-house guest to another room: old room -> dirty, new room -> occupied.
+  const switchRoom = async (bookingId, newRoomNumber, newPersons, reason) => {
+    const booking = bookings.find((b) => b.id === bookingId);
+    if (!booking || booking.status !== "checked_in" || booking.roomNumber === newRoomNumber) return;
+    const oldRoom = rooms.find((r) => r.number === booking.roomNumber);
+    const newRoom = rooms.find((r) => r.number === newRoomNumber);
+    if (!newRoom) return;
+    const persons = newPersons || booking.persons;
+    const guest = guests.find((g) => g.id === booking.guestId);
+    const noteText = `${todayISO()} · Room ${booking.roomNumber} → ${newRoomNumber} · ${(reason || "").trim()}`;
+    const newGuestNotes = guest ? appendSwitchNote(guest.notes, bookingId, noteText) : null;
+    if (supabaseSession) {
+      try {
+        const token = supabaseSession.access_token;
+        await supabasePatchChecked(`bookings?id=eq.${bookingId}`, {
+          accessToken: token,
+          what: "Room switch (booking)",
+          body: { room_id: newRoom.id, persons },
+        });
+        await supabasePatchChecked(`rooms?id=eq.${newRoom.id}`, { accessToken: token, what: "New room status", body: { status: "occupied" } });
+        if (oldRoom) {
+          await supabasePatchChecked(`rooms?id=eq.${oldRoom.id}`, { accessToken: token, what: "Old room status", body: { status: "vacant_dirty" } });
+        }
+        setBookings((bs) =>
+          bs.map((b) => (b.id === bookingId ? { ...b, roomId: newRoom.id, roomNumber: newRoomNumber, persons, partySize: persons } : b))
+        );
+        if (guest) {
+          try {
+            await supabasePatchChecked(`guests?id=eq.${guest.id}`, {
+              accessToken: token,
+              what: "Switch reason (guest note)",
+              body: { notes: newGuestNotes },
+            });
+            setGuests((gs) => gs.map((g) => (g.id === guest.id ? { ...g, notes: newGuestNotes } : g)));
+          } catch (e) {
+            flashError(`Room switched, but the reason wasn't saved: ${e.message}`);
+          }
+        }
+        setRooms((rs) =>
+          rs.map((r) =>
+            r.number === newRoomNumber ? { ...r, status: "occupied" } : r.number === booking.roomNumber ? { ...r, status: "vacant_dirty" } : r
+          )
+        );
+      } catch (e) {
+        flashError(`Couldn't switch room: ${e.message}`);
+      }
+      return;
+    }
+    const nextBookings = bookings.map((b) =>
+      b.id === bookingId ? { ...b, roomNumber: newRoomNumber, persons, partySize: persons } : b
+    );
+    const nextRooms = rooms.map((r) =>
+      r.number === newRoomNumber ? { ...r, status: "occupied" } : r.number === booking.roomNumber ? { ...r, status: "vacant_dirty" } : r
+    );
+    const nextGuests = guest ? guests.map((g) => (g.id === guest.id ? { ...g, notes: newGuestNotes } : g)) : guests;
+    setBookings(nextBookings);
+    setRooms(nextRooms);
+    setGuests(nextGuests);
+    persist({ bookings: nextBookings, rooms: nextRooms, guests: nextGuests });
+  };
+
   const deleteBookingRecord = async (bookingId) => {
     if (supabaseSession) {
       try {
@@ -1077,7 +1344,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
     updateGuests([...guests, g]);
   };
 
-  const reserveRoom = async ({ roomNumber, guestId, newGuest, checkIn: ci, checkOut: co, checkInNow, persons, mealPlans, bookingType, discountPercent, totalAmount }) => {
+  const reserveRoom = async ({ roomNumber, guestId, newGuest, checkIn: ci, checkOut: co, checkInNow, persons, mealPlans, bookingType, paymentMethod, discountPercent, totalAmount }) => {
     if (supabaseSession) {
       try {
         let finalGuestId = guestId;
@@ -1103,7 +1370,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
           method: "POST",
           body: {
             hotel_id: supabaseSession.hotelId,
-            room_id: room.id,
+            room_id: room ? room.id : null,
             guest_id: finalGuestId,
             check_in: ci,
             check_out: co,
@@ -1111,13 +1378,14 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             meal_plans: mealPlans || [],
             status: checkInNow ? "checked_in" : "reserved",
             booking_type: bookingType || "booking",
+            payment_method: paymentMethod || null,
             discount: discountPercent || 0,
             total_amount: totalAmount || 0,
             created_by: supabaseSession.user.id,
           },
         });
-        setBookings((bs) => [...bs, mapBookingFromDb(insertedBooking, { [room.id]: roomNumber })]);
-        if (checkInNow) {
+        setBookings((bs) => [...bs, mapBookingFromDb(insertedBooking, room ? { [room.id]: roomNumber } : {})]);
+        if (checkInNow && room) {
           await supabaseRest(`rooms?id=eq.${room.id}`, {
             accessToken: supabaseSession.access_token,
             method: "PATCH",
@@ -1150,6 +1418,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
       mealPlans: mealPlans || [],
       status: checkInNow ? "checked_in" : "reserved",
       bookingType: bookingType || "booking",
+      paymentMethod: paymentMethod || "",
       discountPercent: discountPercent || 0,
       totalAmount: totalAmount || 0,
       createdBy: username,
@@ -1242,7 +1511,10 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             gap: "0.75rem",
           }}
         >
-          <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem" }}>
+          <div
+            onClick={() => setManagerTab("home")}
+            style={{ display: "flex", alignItems: "baseline", gap: "0.75rem", cursor: "pointer" }}
+          >
             <span style={{ fontFamily: "Fraunces, serif", fontSize: "1.5rem", fontWeight: 600, letterSpacing: "0.01em" }}>
               Geisum Hotel
             </span>
@@ -1282,7 +1554,6 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             { id: "ticketRecords", label: "Ticket records" },
             { id: "todayReport", label: "Today report" },
             { id: "pricing", label: "Room pricing" },
-            { id: "accountantReport", label: "Accountant report" },
             { id: "users", label: "Users" },
           ].map((t) => (
             <button
@@ -1313,6 +1584,19 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         )}
 
         <main style={{ padding: "1.5rem", maxWidth: 1100, margin: "0 auto" }}>
+          {managerTab === "home" && (
+            <TabHomeScreen
+              tabs={[
+                { id: "analytics", label: "Analytics" },
+                { id: "roomActivity", label: "Room activity" },
+                { id: "ticketRecords", label: "Ticket records" },
+                { id: "todayReport", label: "Today report" },
+                { id: "pricing", label: "Room pricing" },
+                { id: "users", label: "Users" },
+              ]}
+              onSelect={setManagerTab}
+            />
+          )}
           {managerTab === "analytics" && (
             <AnalyticsDashboard
               rooms={rooms}
@@ -1321,6 +1605,8 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
               roomRates={roomRates}
               mealPlanRates={mealPlanRates}
               tickets={tickets}
+              accessToken={supabaseSession?.access_token}
+              hotelId={supabaseSession?.hotelId}
               onDeleteTicket={deleteTicket}
               guestName={guestName}
               onDeleteBooking={deleteBookingRecord}
@@ -1336,10 +1622,15 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             />
           )}
           {managerTab === "ticketRecords" && (
-            <TicketRecordsTab tickets={tickets} onDeleteTicket={deleteTicket} />
+            <TicketRecordsTab
+              accessToken={supabaseSession?.access_token}
+              hotelId={supabaseSession?.hotelId}
+              localTickets={tickets}
+              onDeleteTicket={deleteTicket}
+            />
           )}
           {managerTab === "todayReport" && (
-            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} />
+            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} />
           )}
           {managerTab === "pricing" && (
             <RoomPricingTab
@@ -1349,7 +1640,6 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
               onSaveMealPlans={updateMealPlanRates}
             />
           )}
-          {managerTab === "accountantReport" && <AccountantReportTab supabaseSession={supabaseSession} />}
           {managerTab === "users" && (
             <UsersTab extraUsers={extraUsers} onAddUser={addUser} onDeleteUser={deleteUser} supabaseSession={supabaseSession} />
           )}
@@ -1384,7 +1674,10 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             gap: "0.75rem",
           }}
         >
-          <div style={{ display: "flex", alignItems: "baseline", gap: "0.75rem" }}>
+          <div
+            onClick={() => setManagerTab("home")}
+            style={{ display: "flex", alignItems: "baseline", gap: "0.75rem", cursor: "pointer" }}
+          >
             <span style={{ fontFamily: "Fraunces, serif", fontSize: "1.5rem", fontWeight: 600, letterSpacing: "0.01em" }}>
               Geisum Hotel
             </span>
@@ -1453,6 +1746,18 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         )}
 
         <main style={{ padding: "1.5rem", maxWidth: 1100, margin: "0 auto" }}>
+          {managerTab === "home" && (
+            <TabHomeScreen
+              tabs={[
+                { id: "analytics", label: "Analytics" },
+                { id: "roomActivity", label: "Room activity" },
+                { id: "ticketRecords", label: "Ticket records" },
+                { id: "todayReport", label: "Today report" },
+                { id: "pricing", label: "Room pricing" },
+              ]}
+              onSelect={setManagerTab}
+            />
+          )}
           {managerTab === "analytics" && (
             <AnalyticsDashboard
               rooms={rooms}
@@ -1461,6 +1766,8 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
               roomRates={roomRates}
               mealPlanRates={mealPlanRates}
               tickets={tickets}
+              accessToken={supabaseSession?.access_token}
+              hotelId={supabaseSession?.hotelId}
               guestName={guestName}
             />
           )}
@@ -1473,9 +1780,15 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
               mealPlanRates={mealPlanRates}
             />
           )}
-          {managerTab === "ticketRecords" && <TicketRecordsTab tickets={tickets} />}
+          {managerTab === "ticketRecords" && (
+            <TicketRecordsTab
+              accessToken={supabaseSession?.access_token}
+              hotelId={supabaseSession?.hotelId}
+              localTickets={tickets}
+            />
+          )}
           {managerTab === "todayReport" && (
-            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} />
+            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} />
           )}
           {managerTab === "pricing" && (
             <RoomPricingTab
@@ -1641,6 +1954,8 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             onCheckIn={checkIn}
             onCheckOut={checkOut}
             onCancel={cancelBooking}
+            onUpdateBooking={updateBooking}
+            onSwitchRoom={switchRoom}
             showNew={showNewBooking}
             setShowNew={setShowNewBooking}
             roomRates={roomRates}
@@ -1680,7 +1995,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         )}
         {tab === "tickets" && <TicketsTab tickets={tickets} onAddTicket={addTicket} />}
         {tab === "todayReport" && (
-          <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} />
+          <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} />
         )}
       </main>
 
@@ -1918,6 +2233,22 @@ function RoomsTab({ rooms, counts, onSelect, activeBookingForRoom, guestName, ch
   );
 }
 
+function PaymentMethodPicker({ value, onChange }) {
+  return (
+    <div style={{ marginBottom: "0.75rem" }}>
+      <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Payment method</div>
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+        {PAYMENT_METHODS.map((m) => (
+          <label key={m.key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.82rem", cursor: "pointer" }}>
+            <input type="checkbox" checked={value === m.key} onChange={() => onChange(value === m.key ? "" : m.key)} />
+            {m.label}
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function RoomDrawer({ room, onClose, onSetStatus, booking, guestName, onCheckOut, checkoutCounts, onPostponeMaintenance, guests, allBookings, onReserve, roomRates, mealPlanRates }) {
   const checkoutsSinceCheck = (checkoutCounts[room.number] || 0) - (room.maintenanceBaseline || 0);
   const needsMaintenance = checkoutsSinceCheck >= MAINTENANCE_THRESHOLD;
@@ -1938,6 +2269,7 @@ function RoomDrawer({ room, onClose, onSetStatus, booking, guestName, onCheckOut
     persons: occupancyOptions[0],
     mealPlans: [],
     bookingType: "booking",
+    paymentMethod: "",
     discountPercent: 0,
     totalAmount: "",
   });
@@ -1978,8 +2310,8 @@ function RoomDrawer({ room, onClose, onSetStatus, booking, guestName, onCheckOut
       setFormError("Choose a guest, or switch to \"New guest\".");
       return;
     }
-    if (guestMode === "new" && (!form.name || !form.nationalId)) {
-      setFormError("Guest name and national ID / passport number are required.");
+    if (guestMode === "new" && !form.name.trim()) {
+      setFormError("Guest name is required.");
       return;
     }
     if (guestMode === "new" && duplicateGuestWarning) {
@@ -2004,6 +2336,7 @@ function RoomDrawer({ room, onClose, onSetStatus, booking, guestName, onCheckOut
       persons: form.persons,
       mealPlans: showMealPlans ? form.mealPlans : [],
       bookingType: form.bookingType,
+      paymentMethod: form.paymentMethod,
       discountPercent,
       totalAmount: grossTotal,
     });
@@ -2150,7 +2483,7 @@ function RoomDrawer({ room, onClose, onSetStatus, booking, guestName, onCheckOut
               <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 8 }}>
                 <input placeholder="Full name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} style={inputStyle} />
                 <input
-                  placeholder="National ID / passport number"
+                  placeholder="National ID / passport number (optional)"
                   value={form.nationalId}
                   onChange={(e) => setForm({ ...form, nationalId: e.target.value })}
                   onBlur={(e) => checkDuplicateNationalId(e.target.value)}
@@ -2161,7 +2494,7 @@ function RoomDrawer({ room, onClose, onSetStatus, booking, guestName, onCheckOut
                     ⚠ {duplicateGuestWarning}
                   </div>
                 )}
-                <input placeholder="Phone" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} style={inputStyle} />
+                <input placeholder="Phone (optional)" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} style={inputStyle} />
                 <input placeholder="Email (optional)" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} style={inputStyle} />
               </div>
             )}
@@ -2241,6 +2574,8 @@ function RoomDrawer({ room, onClose, onSetStatus, booking, guestName, onCheckOut
               </div>
             )}
 
+            <PaymentMethodPicker value={form.paymentMethod} onChange={(v) => setForm({ ...form, paymentMethod: v })} />
+
             <div style={{ marginBottom: 8 }}>
               <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Estimated total (EGP)</div>
               <input
@@ -2309,7 +2644,9 @@ function RoomDrawer({ room, onClose, onSetStatus, booking, guestName, onCheckOut
   );
 }
 
-function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckIn, onCheckOut, onCancel, showNew, setShowNew, onReserve, roomRates, mealPlanRates }) {
+function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckIn, onCheckOut, onCancel, onUpdateBooking, onSwitchRoom, showNew, setShowNew, onReserve, roomRates, mealPlanRates }) {
+  const [editingId, setEditingId] = useState(null);
+  const [switchingId, setSwitchingId] = useState(null);
   const [guestMode, setGuestMode] = useState(guests.length ? "existing" : "new");
   const [form, setForm] = useState({
     roomNumber: "",
@@ -2323,6 +2660,7 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
     persons: 1,
     mealPlans: [],
     bookingType: "booking",
+    paymentMethod: "",
     discountPercent: 0,
     totalAmount: "",
   });
@@ -2376,16 +2714,16 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
 
   const submit = () => {
     setFormError("");
-    if (!form.roomNumber || !form.checkOut) {
-      setFormError("Fill in room and check-out date.");
+    if (!form.checkOut) {
+      setFormError("Fill in the check-out date.");
       return;
     }
     if (guestMode === "existing" && !form.guestId) {
       setFormError("Choose a guest, or switch to \"New guest\".");
       return;
     }
-    if (guestMode === "new" && (!form.name || !form.nationalId)) {
-      setFormError("Guest name and national ID / passport number are required.");
+    if (guestMode === "new" && !form.name.trim()) {
+      setFormError("Guest name is required.");
       return;
     }
     if (guestMode === "new" && duplicateGuestWarning) {
@@ -2396,7 +2734,7 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
       setFormError("Check-out must be after check-in.");
       return;
     }
-    const clash = findConflict(allBookings, form.roomNumber, form.checkIn, form.checkOut);
+    const clash = form.roomNumber ? findConflict(allBookings, form.roomNumber, form.checkIn, form.checkOut) : null;
     if (clash) {
       setFormError(
         `Room ${form.roomNumber} is already booked for ${guestName(clash.guestId)} from ${fmtDate(clash.checkIn)} to ${fmtDate(clash.checkOut)}. Pick different dates or another room.`
@@ -2416,6 +2754,7 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
       persons: form.persons,
       mealPlans: showMealPlans ? form.mealPlans : [],
       bookingType: form.bookingType,
+      paymentMethod: form.paymentMethod,
       discountPercent,
       totalAmount: grossTotal,
     });
@@ -2431,6 +2770,7 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
       persons: 1,
       mealPlans: [],
       bookingType: "booking",
+      paymentMethod: "",
       discountPercent: 0,
       totalAmount: "",
     });
@@ -2568,7 +2908,7 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
               <input type="date" value={form.checkOut} onChange={(e) => setForm({ ...form, checkOut: e.target.value })} style={{ ...inputStyle, width: "100%" }} />
             </div>
             <select value={form.roomNumber} onChange={(e) => pickRoom(e.target.value)} style={{ ...inputStyle, gridColumn: "1 / -1" }}>
-              <option value="">Room…</option>
+              <option value="">Room (optional — choose later)…</option>
               {roomOptions.map(({ room: r, checkingOut }) => (
                 <option key={r.number} value={r.number}>
                   {r.number} · {r.type}
@@ -2606,7 +2946,7 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
             <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: "0.75rem" }}>
               <input placeholder="Full name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} style={inputStyle} />
               <input
-                placeholder="National ID / passport number"
+                placeholder="National ID / passport number (optional)"
                 value={form.nationalId}
                 onChange={(e) => setForm({ ...form, nationalId: e.target.value })}
                 onBlur={(e) => checkDuplicateNationalId(e.target.value)}
@@ -2617,7 +2957,7 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
                   ⚠ {duplicateGuestWarning}
                 </div>
               )}
-              <input placeholder="Phone" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} style={inputStyle} />
+              <input placeholder="Phone (optional)" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} style={inputStyle} />
               <input placeholder="Email (optional)" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} style={inputStyle} />
             </div>
           )}
@@ -2661,6 +3001,8 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
               </div>
             </div>
           )}
+
+          <PaymentMethodPicker value={form.paymentMethod} onChange={(v) => setForm({ ...form, paymentMethod: v })} />
 
           <div style={{ marginBottom: "0.75rem" }}>
             <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Estimated total (EGP)</div>
@@ -2726,7 +3068,7 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
           <div key={b.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
             <div>
               <div style={{ fontWeight: 600 }}>
-                Room {b.roomNumber} · {guestName(b.guestId)}
+                {roomLabel(b.roomNumber)} · {guestName(b.guestId)}
               </div>
               <div style={{ fontSize: "0.8rem", color: TOKENS.inkSoft, marginBottom: 4 }}>
                 {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)} ·{" "}
@@ -2745,11 +3087,19 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
               >
                 {bookingTypeMeta(b.bookingType).label}
               </span>
+              {b.paymentMethod && (
+                <span style={{ display: "inline-flex", fontSize: "0.68rem", color: TOKENS.inkSoft, border: `1px solid ${TOKENS.paperDim}`, borderRadius: 999, padding: "2px 8px", marginLeft: 6 }}>
+                  {paymentMethodLabel(b.paymentMethod)}
+                </span>
+              )}
             </div>
             <div style={{ display: "flex", gap: 6 }}>
               {b.status === "reserved" && (
                 <>
-                  <button onClick={() => onCheckIn(b.id)} style={primaryBtn}>
+                  <button onClick={() => setEditingId(b.id)} style={ghostBtn}>
+                    Edit
+                  </button>
+                  <button onClick={() => (b.roomNumber ? onCheckIn(b.id) : setEditingId(b.id))} style={primaryBtn} title={b.roomNumber ? "" : "Choose a room first"}>
                     Check in
                   </button>
                   <button onClick={() => onCancel(b.id)} style={ghostBtn}>
@@ -2758,13 +3108,365 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
                 </>
               )}
               {b.status === "checked_in" && (
-                <button onClick={() => onCheckOut(b.id)} style={primaryBtn}>
-                  Check out
-                </button>
+                <>
+                  <button onClick={() => setEditingId(b.id)} style={ghostBtn}>
+                    Edit
+                  </button>
+                  <button onClick={() => setSwitchingId(b.id)} style={ghostBtn}>
+                    Switch
+                  </button>
+                  <button onClick={() => onCheckOut(b.id)} style={primaryBtn}>
+                    Check out
+                  </button>
+                </>
               )}
             </div>
           </div>
         ))}
+      </div>
+
+      {editingId && allBookings.find((b) => b.id === editingId) && (
+        <EditBookingModal
+          booking={allBookings.find((b) => b.id === editingId)}
+          guest={guests.find((g) => g.id === allBookings.find((b) => b.id === editingId).guestId)}
+          rooms={rooms}
+          guests={guests}
+          allBookings={allBookings}
+          guestName={guestName}
+          mealPlanRates={mealPlanRates}
+          onSave={(fields, guestPatch) => {
+            onUpdateBooking(editingId, fields, guestPatch);
+            setEditingId(null);
+          }}
+          onClose={() => setEditingId(null)}
+        />
+      )}
+
+      {switchingId && allBookings.find((b) => b.id === switchingId) && (
+        <SwitchRoomModal
+          booking={allBookings.find((b) => b.id === switchingId)}
+          rooms={rooms}
+          allBookings={allBookings}
+          guestName={guestName}
+          onSwitch={(roomNumber, persons, reason) => {
+            onSwitchRoom(switchingId, roomNumber, persons, reason);
+            setSwitchingId(null);
+          }}
+          onClose={() => setSwitchingId(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+const modalOverlay = {
+  position: "fixed",
+  inset: 0,
+  background: "rgba(27,36,48,0.4)",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  zIndex: 60,
+  padding: "1rem",
+};
+const modalBox = {
+  background: TOKENS.paper,
+  borderRadius: 12,
+  padding: "1.25rem",
+  width: 480,
+  maxWidth: "100%",
+  maxHeight: "92vh",
+  overflowY: "auto",
+};
+
+function EditBookingModal({ booking, guest, rooms, guests, allBookings, guestName, mealPlanRates, onSave, onClose }) {
+  const inHouse = booking.status === "checked_in";
+  const [form, setForm] = useState({
+    roomNumber: booking.roomNumber,
+    checkIn: booking.checkIn,
+    checkOut: booking.checkOut,
+    persons: booking.persons || 1,
+    mealPlans: booking.mealPlans || [],
+    bookingType: booking.bookingType || "booking",
+    paymentMethod: booking.paymentMethod || "",
+    discountPercent: booking.discountPercent || 0,
+    totalAmount: booking.totalAmount || "",
+  });
+  const [g, setG] = useState({
+    name: guest?.name || "",
+    phone: guest?.phone || "",
+    email: guest?.email || "",
+    nationalId: guest?.nationalId || "",
+  });
+  const [error, setError] = useState("");
+
+  const room = rooms.find((r) => r.number === form.roomNumber);
+  const occupancyOptions = room ? occupancyOptionsForType(room.type) : [1, 2, 3];
+  const validRange = form.checkIn && form.checkOut && form.checkOut > form.checkIn;
+
+  // Reserved bookings can move to any free room; in-house guests use "Switch" instead.
+  const roomChoices = useMemo(
+    () =>
+      rooms.filter(
+        (r) =>
+          r.number === booking.roomNumber ||
+          (r.status !== "out_of_order" && validRange && !findConflict(allBookings, r.number, form.checkIn, form.checkOut, booking.id))
+      ),
+    [rooms, allBookings, form.checkIn, form.checkOut, validRange, booking]
+  );
+
+  const pickRoom = (roomNumber) => {
+    const r = rooms.find((x) => x.number === roomNumber);
+    const opts = r ? occupancyOptionsForType(r.type) : [1, 2, 3];
+    setForm((f) => ({ ...f, roomNumber, persons: opts.includes(f.persons) ? f.persons : opts[opts.length - 1] }));
+  };
+
+  const save = () => {
+    setError("");
+    if (!g.name.trim()) return setError("Guest name is required.");
+    if (!form.checkIn || !form.checkOut || form.checkOut <= form.checkIn) return setError("Check-out must be after check-in.");
+    const nid = g.nationalId.trim().toLowerCase();
+    if (nid) {
+      const dup = guests.find((x) => x.id !== booking.guestId && (x.nationalId || "").trim().toLowerCase() === nid);
+      if (dup) return setError(`This ID already belongs to another guest: ${dup.name}.`);
+    }
+    const clash = findConflict(allBookings, form.roomNumber, form.checkIn, form.checkOut, booking.id);
+    if (clash) {
+      return setError(
+        `Room ${form.roomNumber} is already booked for ${guestName(clash.guestId)} from ${fmtDate(clash.checkIn)} to ${fmtDate(clash.checkOut)}.`
+      );
+    }
+    const discountPercent = Math.min(100, Math.max(0, Number(form.discountPercent) || 0));
+    onSave(
+      {
+        roomNumber: form.roomNumber,
+        checkIn: form.checkIn,
+        checkOut: form.checkOut,
+        persons: form.persons,
+        mealPlans: form.mealPlans,
+        bookingType: form.bookingType,
+        paymentMethod: form.paymentMethod,
+        discountPercent,
+        totalAmount: Number(form.totalAmount) || 0,
+      },
+      { name: g.name.trim(), phone: g.phone.trim(), email: g.email.trim(), nationalId: g.nationalId.trim() }
+    );
+  };
+
+  const label = { fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 };
+
+  return (
+    <div style={modalOverlay} onClick={onClose}>
+      <div style={modalBox} onClick={(e) => e.stopPropagation()}>
+        <h3 style={{ fontFamily: "Fraunces, serif", fontSize: "1.15rem", margin: "0 0 0.75rem" }}>
+          Edit booking · {roomLabel(booking.roomNumber)}
+        </h3>
+
+        <div style={{ ...label, fontWeight: 600, color: TOKENS.ink }}>Guest</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: "0.5rem" }}>
+          <input placeholder="Full name" value={g.name} onChange={(e) => setG({ ...g, name: e.target.value })} style={inputStyle} />
+          <input placeholder="National ID / passport" value={g.nationalId} onChange={(e) => setG({ ...g, nationalId: e.target.value })} style={inputStyle} />
+          <input placeholder="Phone" value={g.phone} onChange={(e) => setG({ ...g, phone: e.target.value })} style={inputStyle} />
+          <input placeholder="Email (optional)" value={g.email} onChange={(e) => setG({ ...g, email: e.target.value })} style={inputStyle} />
+        </div>
+        <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: "0.9rem" }}>
+          Guest changes apply to the guest's profile (all of their bookings).
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.75rem", marginBottom: "0.75rem" }}>
+          <div>
+            <div style={label}>Check-in</div>
+            <input
+              type="date"
+              value={form.checkIn}
+              disabled={inHouse}
+              onChange={(e) => setForm({ ...form, checkIn: e.target.value })}
+              style={{ ...inputStyle, width: "100%", opacity: inHouse ? 0.6 : 1 }}
+            />
+          </div>
+          <div>
+            <div style={label}>Check-out</div>
+            <input type="date" value={form.checkOut} onChange={(e) => setForm({ ...form, checkOut: e.target.value })} style={{ ...inputStyle, width: "100%" }} />
+          </div>
+        </div>
+
+        <div style={{ marginBottom: "0.75rem" }}>
+          <div style={label}>Room</div>
+          {!booking.roomNumber && (
+            <div style={{ fontSize: "0.76rem", color: TOKENS.dirty, marginBottom: 6 }}>
+              This booking has no room yet. Pick one below when the guest arrives, then check in.
+            </div>
+          )}
+          {inHouse ? (
+            <div style={{ fontSize: "0.82rem", color: TOKENS.inkSoft }}>
+              Room {booking.roomNumber} — to move the guest to another room use the <strong>Switch</strong> button.
+            </div>
+          ) : (
+            <select value={form.roomNumber} onChange={(e) => pickRoom(e.target.value)} style={{ ...inputStyle, width: "100%" }}>
+              <option value="">No room assigned yet</option>
+              {roomChoices.map((r) => (
+                <option key={r.number} value={r.number}>
+                  {r.number} · {r.type}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+
+        <div style={{ marginBottom: "0.75rem" }}>
+          <div style={label}>How many people</div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {occupancyOptions.map((n) => (
+              <button key={n} onClick={() => setForm({ ...form, persons: n })} style={{ ...ghostBtn, flex: 1, background: form.persons === n ? TOKENS.paperDim : "#fff" }}>
+                {n}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ marginBottom: "0.75rem" }}>
+          <div style={label}>Meal plan</div>
+          <select
+            value={form.mealPlans[0] || ""}
+            onChange={(e) => setForm({ ...form, mealPlans: e.target.value ? [e.target.value] : [] })}
+            style={{ ...inputStyle, width: "100%" }}
+          >
+            <option value="">None</option>
+            {GUEST_MEAL_PLAN_CHOICES.map((plan) => (
+              <option key={plan} value={plan}>
+                {plan} {FREE_MEAL_PLANS.includes(plan) ? "(no charge)" : `(+${fmtMoney((mealPlanRates && mealPlanRates[plan]) || 0)}/person/night)`}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div style={{ marginBottom: "0.75rem" }}>
+          <div style={label}>Booking type</div>
+          <select value={form.bookingType} onChange={(e) => setForm({ ...form, bookingType: e.target.value })} style={{ ...inputStyle, width: "100%" }}>
+            {BOOKING_TYPES.map((t) => (
+              <option key={t.key} value={t.key}>
+                {t.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <PaymentMethodPicker value={form.paymentMethod} onChange={(v) => setForm({ ...form, paymentMethod: v })} />
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.75rem", marginBottom: "0.75rem" }}>
+          <div>
+            <div style={label}>Total (EGP)</div>
+            <input type="number" min="0" step="1" value={form.totalAmount} onChange={(e) => setForm({ ...form, totalAmount: e.target.value })} style={{ ...inputStyle, width: "100%" }} />
+          </div>
+          <div>
+            <div style={label}>Discount (%)</div>
+            <input type="number" min="0" max="100" step="1" value={form.discountPercent} onChange={(e) => setForm({ ...form, discountPercent: e.target.value })} style={{ ...inputStyle, width: "100%" }} />
+          </div>
+        </div>
+
+        {error && (
+          <div style={{ fontSize: "0.8rem", color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginBottom: 8 }}>
+            {error}
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button onClick={onClose} style={ghostBtn}>
+            Close
+          </button>
+          <button onClick={save} style={primaryBtn}>
+            Save changes
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SwitchRoomModal({ booking, rooms, allBookings, guestName, onSwitch, onClose }) {
+  const from = todayISO() > booking.checkIn ? todayISO() : booking.checkIn;
+  const to = booking.checkOut > from ? booking.checkOut : addDaysISO(from, 1);
+  const [target, setTarget] = useState("");
+  const [reason, setReason] = useState("");
+
+  const candidates = rooms.filter(
+    (r) =>
+      r.number !== booking.roomNumber &&
+      (r.status === "vacant_clean" || r.status === "vacant_dirty") &&
+      !findConflict(allBookings, r.number, from, to, booking.id)
+  );
+  const targetRoom = rooms.find((r) => r.number === target);
+  const maxPersons = targetRoom ? Math.max(...occupancyOptionsForType(targetRoom.type)) : null;
+  const tooMany = maxPersons !== null && (booking.persons || 1) > maxPersons;
+  const currentRoom = rooms.find((r) => r.number === booking.roomNumber);
+
+  return (
+    <div style={modalOverlay} onClick={onClose}>
+      <div style={modalBox} onClick={(e) => e.stopPropagation()}>
+        <h3 style={{ fontFamily: "Fraunces, serif", fontSize: "1.15rem", margin: "0 0 0.25rem" }}>Switch room</h3>
+        <div style={{ fontSize: "0.82rem", color: TOKENS.inkSoft, marginBottom: "0.9rem" }}>
+          {guestName(booking.guestId)} · now in Room {booking.roomNumber}
+          {currentRoom ? ` (${currentRoom.type})` : ""} · until {fmtDate(booking.checkOut)}
+        </div>
+
+        {candidates.length === 0 ? (
+          <div style={{ color: TOKENS.inkSoft, fontSize: "0.85rem", marginBottom: "0.9rem" }}>
+            No free rooms available for the rest of the stay.
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: "0.9rem", maxHeight: 280, overflowY: "auto" }}>
+            {candidates.map((r) => (
+              <button
+                key={r.number}
+                onClick={() => setTarget(r.number)}
+                style={{ ...ghostBtn, textAlign: "left", padding: "0.45rem 0.65rem", background: target === r.number ? TOKENS.paperDim : "#fff" }}
+              >
+                {r.number} · {r.type}
+                <span style={{ color: TOKENS.inkSoft, fontSize: "0.72rem" }}>
+                  {" "}
+                  — {r.status === "vacant_clean" ? "clean" : "needs cleaning"}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {target && (
+          <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, marginBottom: "0.75rem" }}>
+            Room {booking.roomNumber} will be marked <strong>needs cleaning</strong> and Room {target} <strong>occupied</strong>.
+            {tooMany && (
+              <div style={{ color: TOKENS.dirty, marginTop: 4 }}>
+                Room {target} sleeps up to {maxPersons}; guests will be set to {maxPersons}.
+              </div>
+            )}
+          </div>
+        )}
+
+        <div style={{ marginBottom: "0.9rem" }}>
+          <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Reason for switching (required)</div>
+          <textarea
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="e.g. AC not working, guest asked for a quieter room…"
+            rows={3}
+            style={{ ...inputStyle, width: "100%", resize: "vertical", boxSizing: "border-box" }}
+          />
+          <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginTop: 4 }}>
+            Saved in the guest's notes and shown under this reservation in the Guests tab.
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button onClick={onClose} style={ghostBtn}>
+            Close
+          </button>
+          <button
+            onClick={() => onSwitch(target, tooMany ? maxPersons : booking.persons, reason.trim())}
+            style={{ ...primaryBtn, opacity: target && reason.trim() ? 1 : 0.5 }}
+            disabled={!target || !reason.trim()}
+          >
+            Switch room
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -2849,7 +3551,9 @@ function GuestsTab({ guests, search, setSearch, showNew, setShowNew, onCreate, b
                   {g.nationalId && (
                     <div style={{ fontSize: "0.76rem", color: TOKENS.inkSoft, marginTop: 2 }}>ID: {g.nationalId}</div>
                   )}
-                  {g.notes && <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, marginTop: 4 }}>{g.notes}</div>}
+                  {splitGuestNotes(g.notes).plain && (
+                    <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, marginTop: 4, whiteSpace: "pre-wrap" }}>{splitGuestNotes(g.notes).plain}</div>
+                  )}
                 </div>
                 {room && <Pill status="occupied" />}
               </div>
@@ -2868,7 +3572,7 @@ function GuestsTab({ guests, search, setSearch, showNew, setShowNew, onCreate, b
                   {history.map((b) => (
                     <div key={b.id} style={{ background: TOKENS.paper, border: `1px solid ${TOKENS.paperDim}`, borderRadius: 8, padding: "0.6rem 0.75rem" }}>
                       <div style={{ fontWeight: 600, fontSize: "0.85rem" }}>
-                        Room {b.roomNumber} · {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)}
+                        {roomLabel(b.roomNumber)} · {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)}
                       </div>
                       <div style={{ fontSize: "0.76rem", color: TOKENS.inkSoft, marginTop: 2 }}>
                         {b.status === "checked_in" ? "In house" : b.status === "checked_out" ? "Checked out" : b.status === "cancelled" ? "Cancelled" : "Reserved"}
@@ -2890,10 +3594,30 @@ function GuestsTab({ guests, search, setSearch, showNew, setShowNew, onCreate, b
                         >
                           {bookingTypeMeta(b.bookingType).label}
                         </span>
+                        {b.paymentMethod && (
+                          <span style={{ fontSize: "0.68rem", color: TOKENS.inkSoft, border: `1px solid ${TOKENS.paperDim}`, borderRadius: 999, padding: "2px 8px" }}>
+                            {paymentMethodLabel(b.paymentMethod)}
+                          </span>
+                        )}
                         {Number(b.totalAmount) > 0 && (
                           <span style={{ fontSize: "0.76rem", color: TOKENS.ink, fontWeight: 600 }}>{fmtMoney(Number(b.totalAmount))}</span>
                         )}
                       </div>
+                      {(splitGuestNotes(g.notes).switches[b.id] || []).map((txt, i) => (
+                        <div
+                          key={i}
+                          style={{
+                            marginTop: 6,
+                            fontSize: "0.76rem",
+                            color: TOKENS.dirty,
+                            background: TOKENS.dirtyBg,
+                            borderRadius: 6,
+                            padding: "0.4rem 0.6rem",
+                          }}
+                        >
+                          ⇄ Room switch: {txt}
+                        </div>
+                      ))}
                     </div>
                   ))}
                 </div>
@@ -3198,40 +3922,67 @@ const ROOM_FILTERS = [
   { key: "revenue", label: "Revenue" },
 ];
 
-function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRates, mealPlanRates, tickets, onDeleteTicket, guestName, onDeleteBooking }) {
+function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRates, mealPlanRates, tickets, accessToken, hotelId, onDeleteTicket, guestName, onDeleteBooking }) {
   const [rangeStart, setRangeStart] = useState(startOfMonthISO());
   const [rangeEnd, setRangeEnd] = useState(todayISO());
-  const [calYear, setCalYear] = useState(() => Number(todayISO().slice(0, 4)));
-  const [calMonth, setCalMonth] = useState(() => Number(todayISO().slice(5, 7)) - 1);
-
-  const reservedDates = useMemo(() => {
-    const set = new Set();
-    bookings
-      .filter((b) => b.status === "reserved" || b.status === "checked_in")
-      .forEach((b) => {
-        let d = b.checkIn;
-        while (d < b.checkOut) {
-          set.add(d);
-          d = addDaysISO(d, 1);
-        }
-      });
-    return set;
-  }, [bookings]);
-
-  const [selectedDate, setSelectedDate] = useState(null);
-
-  const dayBookings = useMemo(() => {
-    if (!selectedDate) return [];
-    return bookings
-      .filter((b) => b.status !== "cancelled" && b.checkIn <= selectedDate && selectedDate < b.checkOut)
-      .sort((a, b) => a.roomNumber.localeCompare(b.roomNumber));
-  }, [bookings, selectedDate]);
-
   const rangeEndExclusive = addDaysISO(rangeEnd, 1);
+
+  const roomNumberById = useMemo(() => {
+    const map = {};
+    (rooms || []).forEach((r) => {
+      map[r.id] = r.number;
+    });
+    return map;
+  }, [rooms]);
+
+  // Analytics fetches its own bounded slice of bookings instead of relying on
+  // the app-wide `bookings` array, which keeps growing for as long as the
+  // hotel operates — just the ones overlapping the selected revenue range.
+  // In local/demo mode (no hotelId) it falls back to filtering the in-memory
+  // array, since there's no Supabase table to query against.
+  const [rangeBookings, setRangeBookings] = useState([]);
+  const [loadingRange, setLoadingRange] = useState(true);
+  const [loadError, setLoadError] = useState("");
+
+  useEffect(() => {
+    if (!hotelId) {
+      setRangeBookings((bookings || []).filter((b) => b.checkIn < rangeEndExclusive && b.checkOut > rangeStart));
+      setLoadingRange(false);
+      return;
+    }
+    let cancelled = false;
+    setLoadingRange(true);
+    fetchBookingsOverlappingRange({ accessToken, hotelId, rangeStart, rangeEndExclusive, roomNumberById })
+      .then((rows) => {
+        if (!cancelled) setRangeBookings(rows);
+      })
+      .catch(() => {
+        if (!cancelled) setLoadError("Couldn't load bookings for this range — check your connection and try again.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingRange(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken, hotelId, bookings, rangeStart, rangeEndExclusive, roomNumberById]);
+
+  // Index once by room number (O(bookings)) instead of re-filtering the full
+  // array once per room (O(rooms × bookings)) — the loop that was freezing
+  // mobile browsers once the hotel had enough history.
+  const bookingsByRoom = useMemo(() => {
+    const map = new Map();
+    rangeBookings.forEach((b) => {
+      if (b.status === "cancelled") return;
+      if (!map.has(b.roomNumber)) map.set(b.roomNumber, []);
+      map.get(b.roomNumber).push(b);
+    });
+    return map;
+  }, [rangeBookings]);
 
   const perRoom = useMemo(() => {
     return rooms.map((room) => {
-      const roomBookings = bookings.filter((b) => b.roomNumber === room.number && b.status !== "cancelled");
+      const roomBookings = bookingsByRoom.get(room.number) || [];
       const reservations = roomBookings.filter((b) => b.checkIn >= rangeStart && b.checkIn < rangeEndExclusive).length;
       const stayedBookings = roomBookings.filter((b) => b.status === "checked_in" || b.status === "checked_out");
       const nights = stayedBookings.reduce(
@@ -3257,7 +4008,7 @@ function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRat
       }, 0);
       return { room, reservations, nights, maintenance, revenue };
     });
-  }, [rooms, bookings, maintenanceLog, rangeStart, rangeEndExclusive, roomRates, mealPlanRates]);
+  }, [rooms, bookingsByRoom, maintenanceLog, rangeStart, rangeEndExclusive, roomRates, mealPlanRates]);
 
   const totals = perRoom.reduce(
     (acc, r) => ({
@@ -3269,17 +4020,36 @@ function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRat
     { reservations: 0, nights: 0, maintenance: 0, revenue: 0 }
   );
 
-  const ticketsInRange = useMemo(
-    () =>
-      (tickets || [])
-        .filter((t) => t.date >= rangeStart && t.date < rangeEndExclusive)
-        .sort((a, b) => b.date.localeCompare(a.date)),
-    [tickets, rangeStart, rangeEndExclusive]
-  );
-  const ticketTotals = ticketsInRange.reduce(
-    (acc, t) => ({ count: acc.count + 1, persons: acc.persons + t.persons, revenue: acc.revenue + t.amountPaid }),
-    { count: 0, persons: 0, revenue: 0 }
-  );
+  // Ticket totals for the selected range are fetched as a small aggregate
+  // query rather than filtered from a fully-downloaded tickets table — the
+  // `tickets` prop is intentionally just a bounded recent slice (see
+  // INITIAL_TICKETS_LIMIT), so filtering it client-side would silently
+  // under-report revenue for any range older than that slice. In local/demo
+  // mode (no hotelId) we fall back to filtering the in-memory array.
+  const [ticketTotals, setTicketTotals] = useState({ count: 0, persons: 0, revenue: 0 });
+  useEffect(() => {
+    if (!hotelId) {
+      const inRange = (tickets || []).filter((t) => t.date >= rangeStart && t.date < rangeEndExclusive);
+      setTicketTotals(
+        inRange.reduce(
+          (acc, t) => ({ count: acc.count + 1, persons: acc.persons + t.persons, revenue: acc.revenue + t.amountPaid }),
+          { count: 0, persons: 0, revenue: 0 }
+        )
+      );
+      return;
+    }
+    let cancelled = false;
+    fetchTicketsRangeTotals({ accessToken, hotelId, rangeStart, rangeEndExclusive })
+      .then((result) => {
+        if (!cancelled) setTicketTotals(result);
+      })
+      .catch(() => {
+        // Leave the previous totals in place rather than flashing to zero on a transient error.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken, hotelId, tickets, rangeStart, rangeEndExclusive]);
   const grandRevenue = totals.revenue + ticketTotals.revenue;
 
   return (
@@ -3307,6 +4077,17 @@ function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRat
         </div>
       </div>
 
+      {loadError && (
+        <div style={{ color: TOKENS.oos, fontSize: "0.85rem", marginBottom: "0.75rem" }}>{loadError}</div>
+      )}
+
+      {loadingRange && rangeBookings.length === 0 ? (
+        // Header + title above have already painted by the time this shows —
+        // the range fetch and the O(bookings) computation below run after
+        // that first paint, not before it, so the tap never looks frozen.
+        <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem", padding: "2rem 0", textAlign: "center" }}>Loading analytics…</div>
+      ) : (
+      <>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "0.75rem", marginBottom: "1.5rem" }}>
         {[
           { label: "Reservations", value: totals.reservations },
@@ -3335,60 +4116,56 @@ function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRat
           <input type="date" value={rangeEnd} onChange={(e) => setRangeEnd(e.target.value)} style={inputStyle} />
         </div>
       </div>
+      </>
+      )}
+    </div>
+  );
+}
 
-      <div style={{ marginBottom: "1.5rem" }}>
-        <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
-          Reservation calendar
-        </div>
-        <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", alignItems: "flex-start" }}>
-          <MonthCalendar
-            year={calYear}
-            month={calMonth}
-            onMonthChange={(y, m) => {
-              setCalYear(y);
-              setCalMonth(m);
-              setSelectedDate(null);
+// Landing screen for the manager/analyst console. Deliberately fetches
+// nothing — each tab loads its own data only once the user picks it, so
+// opening the console never triggers every heavy query at once.
+function TabHomeScreen({ tabs, onSelect }) {
+  return (
+    <div
+      style={{
+        minHeight: "60vh",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "2rem 1rem",
+      }}
+    >
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+          gap: "1rem",
+          maxWidth: 640,
+          width: "100%",
+        }}
+      >
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            onClick={() => onSelect(t.id)}
+            style={{
+              background: "#fff",
+              border: `1px solid ${TOKENS.paperDim}`,
+              borderRadius: 12,
+              padding: "1.5rem 1rem",
+              fontFamily: "Fraunces, serif",
+              fontSize: "1.05rem",
+              fontWeight: 600,
+              color: TOKENS.ink,
+              cursor: "pointer",
+              textAlign: "center",
+              boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
             }}
-            highlightedDates={reservedDates}
-            todayIso={todayISO()}
-            onDayClick={setSelectedDate}
-            selectedDate={selectedDate}
-          />
-          <div style={{ ...cardStyle, flex: "1 1 260px", minWidth: 240, margin: 0 }}>
-            {!selectedDate && (
-              <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>Click a day on the calendar to see its reservations.</div>
-            )}
-            {selectedDate && (
-              <>
-                <div style={{ fontWeight: 600, marginBottom: 8 }}>{fmtDate(selectedDate)}</div>
-                {dayBookings.length === 0 && (
-                  <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>No reservations on this day.</div>
-                )}
-                {dayBookings.map((b) => (
-                  <div key={b.id} style={{ padding: "0.5rem 0", borderBottom: `1px solid ${TOKENS.paperDim}` }}>
-                    <div style={{ fontWeight: 600, fontSize: "0.85rem" }}>Room {b.roomNumber} · {guestName(b.guestId)}</div>
-                    <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft, marginBottom: 4 }}>
-                      {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)} · {b.status.replace("_", " ")}
-                    </div>
-                    <span
-                      style={{
-                        display: "inline-flex",
-                        fontSize: "0.66rem",
-                        fontWeight: 600,
-                        color: bookingTypeMeta(b.bookingType).color,
-                        background: bookingTypeMeta(b.bookingType).bg,
-                        borderRadius: 999,
-                        padding: "2px 8px",
-                      }}
-                    >
-                      {bookingTypeMeta(b.bookingType).label}
-                    </span>
-                  </div>
-                ))}
-              </>
-            )}
-          </div>
-        </div>
+          >
+            {t.label}
+          </button>
+        ))}
       </div>
     </div>
   );
@@ -3573,7 +4350,7 @@ function ReservationRecordsTab({ bookings, guestName, onDeleteBooking }) {
             <div key={b.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
               <div>
                 <div style={{ fontWeight: 600 }}>
-                  Room {b.roomNumber} · {guestName(b.guestId)}
+                  {roomLabel(b.roomNumber)} · {guestName(b.guestId)}
                 </div>
                 <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft }}>
                   {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)} ·{" "}
@@ -3597,7 +4374,16 @@ function ReservationRecordsTab({ bookings, guestName, onDeleteBooking }) {
   );
 }
 
-function TicketRecordsTab({ tickets, onDeleteTicket }) {
+function TicketRecordsTab({ accessToken, hotelId, localTickets, onDeleteTicket }) {
+  // Local/demo mode has no Supabase table to page against — it's an in-memory
+  // array anyway, so keep the old client-side filtering behavior for it.
+  if (!hotelId) {
+    return <LocalTicketRecordsTab tickets={localTickets} onDeleteTicket={onDeleteTicket} />;
+  }
+  return <RemoteTicketRecordsTab accessToken={accessToken} hotelId={hotelId} onDeleteTicket={onDeleteTicket} />;
+}
+
+function LocalTicketRecordsTab({ tickets, onDeleteTicket }) {
   const [rangeStart, setRangeStart] = useState(todayISO());
   const [rangeEnd, setRangeEnd] = useState(todayISO());
   const rangeEndExclusive = addDaysISO(rangeEnd, 1);
@@ -3679,6 +4465,145 @@ function TicketRecordsTab({ tickets, onDeleteTicket }) {
               )}
             </div>
           ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RemoteTicketRecordsTab({ accessToken, hotelId, onDeleteTicket }) {
+  const [rangeStart, setRangeStart] = useState(todayISO());
+  const [rangeEnd, setRangeEnd] = useState(todayISO());
+  const [page, setPage] = useState(0);
+  const [pageRows, setPageRows] = useState([]);
+  const [pageTotal, setPageTotal] = useState(0);
+  const [totals, setTotals] = useState({ count: 0, persons: 0, revenue: 0 });
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const rangeEndExclusive = addDaysISO(rangeEnd, 1);
+
+  // Reset to page 0 whenever the date range changes — a page number from the
+  // previous range rarely makes sense for the new one.
+  useEffect(() => {
+    setPage(0);
+  }, [rangeStart, rangeEnd]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setLoadError("");
+    Promise.all([
+      fetchTicketsPage({ accessToken, hotelId, rangeStart, rangeEndExclusive, page }),
+      fetchTicketsRangeTotals({ accessToken, hotelId, rangeStart, rangeEndExclusive }),
+    ])
+      .then(([pageResult, totalsResult]) => {
+        if (cancelled) return;
+        setPageRows(pageResult.rows);
+        setPageTotal(pageResult.total);
+        setTotals(totalsResult);
+      })
+      .catch((e) => {
+        if (!cancelled) setLoadError("Couldn't load tickets for this range — check your connection and try again.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken, hotelId, rangeStart, rangeEndExclusive, page]);
+
+  const pageCount = Math.max(1, Math.ceil(pageTotal / TICKETS_PAGE_SIZE));
+
+  const handleDelete = (id) => {
+    onDeleteTicket && onDeleteTicket(id);
+    // Optimistically drop it from the current page so the list feels responsive;
+    // the next range/page change will re-fetch the authoritative data anyway.
+    setPageRows((rows) => rows.filter((t) => t.id !== id));
+  };
+
+  return (
+    <div>
+      <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", marginBottom: "1rem" }}>Ticket records</h2>
+
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginBottom: "1.5rem", flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>From</div>
+          <input type="date" value={rangeStart} onChange={(e) => setRangeStart(e.target.value)} style={inputStyle} />
+        </div>
+        <div>
+          <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>To</div>
+          <input type="date" value={rangeEnd} onChange={(e) => setRangeEnd(e.target.value)} style={inputStyle} />
+        </div>
+        <button
+          onClick={() => {
+            setRangeStart(todayISO());
+            setRangeEnd(todayISO());
+          }}
+          style={ghostBtn}
+        >
+          Today
+        </button>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "0.75rem", marginBottom: "1.5rem" }}>
+        {[
+          { label: "Tickets sold", value: totals.count },
+          { label: "Persons", value: totals.persons },
+          { label: "Revenue", value: fmtMoney(totals.revenue) },
+        ].map((c) => (
+          <div key={c.label} style={{ background: "#fff", border: `1px solid ${TOKENS.paperDim}`, borderRadius: 10, padding: "0.9rem" }}>
+            <div style={{ fontSize: "1.3rem", fontWeight: 600, fontFamily: "Fraunces, serif" }}>{c.value}</div>
+            <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>{c.label}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
+        Ticket records in range
+      </div>
+      {loadError && <div style={{ color: TOKENS.oos, fontSize: "0.85rem", marginBottom: 8 }}>{loadError}</div>}
+      {loading ? (
+        <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem" }}>Loading…</div>
+      ) : pageRows.length === 0 ? (
+        <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem" }}>No tickets logged in this range.</div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {pageRows.map((t) => (
+            <div key={t.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+              <div>
+                <div style={{ fontWeight: 600 }}>
+                  {t.persons} {t.persons === 1 ? "person" : "persons"} · {fmtMoney(t.amountPaid)}
+                </div>
+                <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft }}>
+                  {fmtDate(t.date)}
+                  {t.notes ? ` · ${t.notes}` : ""}
+                </div>
+                <div style={{ fontSize: "0.72rem", color: TOKENS.brassDark, marginTop: 2 }}>
+                  Added by {t.createdBy || "unknown"}
+                </div>
+              </div>
+              {onDeleteTicket && (
+                <button onClick={() => handleDelete(t.id)} style={ghostBtn}>
+                  Delete
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {pageTotal > TICKETS_PAGE_SIZE && (
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 12 }}>
+          <button onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={page === 0 || loading} style={ghostBtn}>
+            ← Previous
+          </button>
+          <div style={{ fontSize: "0.8rem", color: TOKENS.inkSoft }}>
+            Page {page + 1} of {pageCount} · {pageTotal} tickets in range
+          </div>
+          <button onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))} disabled={page >= pageCount - 1 || loading} style={ghostBtn}>
+            Next →
+          </button>
         </div>
       )}
     </div>
@@ -3768,9 +4693,65 @@ function SimpleChart({ series, type }) {
   );
 }
 
-function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates }) {
+function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates, accessToken, hotelId, guestName }) {
   const [reportDate, setReportDate] = useState(todayISO());
   const isToday = reportDate === todayISO();
+
+  const roomNumberById = useMemo(() => {
+    const map = {};
+    (rooms || []).forEach((r) => {
+      map[r.id] = r.number;
+    });
+    return map;
+  }, [rooms]);
+
+  // The check-in/check-out room lists for the selected date are fetched with
+  // two narrow, exact-date queries — not filtered out of the full bookings
+  // array — so picking any date (past or future) costs the same regardless
+  // of how much booking history the hotel has accumulated. Local/demo mode
+  // (no hotelId) falls back to filtering the in-memory array.
+  const [checkInRooms, setCheckInRooms] = useState([]);
+  const [checkOutRooms, setCheckOutRooms] = useState([]);
+  const [loadingLists, setLoadingLists] = useState(true);
+  const [listError, setListError] = useState("");
+
+  useEffect(() => {
+    if (!hotelId) {
+      setCheckInRooms(
+        (bookings || [])
+          .filter((b) => b.status !== "cancelled" && b.checkIn === reportDate)
+          .sort((a, b) => a.roomNumber.localeCompare(b.roomNumber))
+      );
+      setCheckOutRooms(
+        (bookings || [])
+          .filter((b) => b.status !== "cancelled" && b.checkOut === reportDate)
+          .sort((a, b) => a.roomNumber.localeCompare(b.roomNumber))
+      );
+      setLoadingLists(false);
+      return;
+    }
+    let cancelled = false;
+    setLoadingLists(true);
+    setListError("");
+    Promise.all([
+      fetchCheckInsOnDate({ accessToken, hotelId, date: reportDate, roomNumberById }),
+      fetchCheckOutsOnDate({ accessToken, hotelId, date: reportDate, roomNumberById }),
+    ])
+      .then(([ins, outs]) => {
+        if (cancelled) return;
+        setCheckInRooms(ins.sort((a, b) => a.roomNumber.localeCompare(b.roomNumber)));
+        setCheckOutRooms(outs.sort((a, b) => a.roomNumber.localeCompare(b.roomNumber)));
+      })
+      .catch(() => {
+        if (!cancelled) setListError("Couldn't load check-in/check-out rooms for this date — check your connection and try again.");
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingLists(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken, hotelId, bookings, reportDate, roomNumberById]);
 
   const roomsReadyForCheckIn = isToday ? rooms.filter((r) => r.status === "vacant_clean").length : null;
   const checkInsToday = bookings.filter((b) => b.status !== "cancelled" && b.checkIn === reportDate).length;
@@ -3864,6 +4845,49 @@ function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates }) {
             <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>{c.label}</div>
           </div>
         ))}
+      </div>
+
+      {listError && <div style={{ color: TOKENS.oos, fontSize: "0.85rem", marginBottom: "0.75rem" }}>{listError}</div>}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "1rem", marginBottom: "1.75rem" }}>
+        <div style={cardStyle}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
+            Check-in rooms {isToday ? "today" : "on this day"}
+          </div>
+          {loadingLists ? (
+            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>Loading…</div>
+          ) : checkInRooms.length === 0 ? (
+            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>No check-ins on this day.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {checkInRooms.map((b) => (
+                <div key={b.id} style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem", borderBottom: `1px solid ${TOKENS.paperDim}`, paddingBottom: 4 }}>
+                  <span style={{ fontWeight: 600 }}>{roomLabel(b.roomNumber)}</span>
+                  <span style={{ color: TOKENS.inkSoft }}>{guestName(b.guestId)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <div style={cardStyle}>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
+            Check-out rooms {isToday ? "today" : "on this day"}
+          </div>
+          {loadingLists ? (
+            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>Loading…</div>
+          ) : checkOutRooms.length === 0 ? (
+            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>No check-outs on this day.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {checkOutRooms.map((b) => (
+                <div key={b.id} style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem", borderBottom: `1px solid ${TOKENS.paperDim}`, paddingBottom: 4 }}>
+                  <span style={{ fontWeight: 600 }}>{roomLabel(b.roomNumber)}</span>
+                  <span style={{ color: TOKENS.inkSoft }}>{guestName(b.guestId)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
@@ -4109,7 +5133,7 @@ function AccountantConsole({ supabaseSession, onLogout }) {
                 }}
               />
             )}
-            {tab === "history" && <FinanceHistoryTab rows={rows} />}
+            {tab === "history" && <FinanceHistoryTab rows={rows} hotelId={hotelId} token={token} />}
           </>
         )}
       </main>
@@ -4426,7 +5450,30 @@ function FinanceExcelImportTab({ onSaveMany }) {
   );
 }
 
-function FinanceHistoryTab({ rows }) {
+const FINANCE_EXPORT_COLUMNS = [
+  { header: "التاريخ", get: (r) => r.entry_date },
+  { header: "سلف اسطاف", get: (r) => Number(r.expense_staff_advances) || 0 },
+  { header: "ايداع البنك", get: (r) => Number(r.expense_bank_deposit) || 0 },
+  { header: "م. تشغيل", get: (r) => Number(r.expense_operating) || 0 },
+  { header: "جارى الشريك - م. مجدى", get: (r) => Number(r.expense_partner_magdy) || 0 },
+  { header: "جارى الشريك - م. محب", get: (r) => Number(r.expense_partner_moheb) || 0 },
+  { header: "جارى الشريك - م. بولا", get: (r) => Number(r.expense_partner_bola) || 0 },
+  { header: "جارى الشريك - م. كاميل", get: (r) => Number(r.expense_partner_kamel) || 0 },
+  { header: "ادوات مكتبيه مطبوعات", get: (r) => Number(r.expense_other) || 0 },
+  { header: "مرتبات", get: (r) => Number(r.expense_salaries) || 0 },
+  { header: "م. ثابته", get: (r) => Number(r.expense_fixed) || 0 },
+  { header: "اجمالى المصروفات", get: (r) => Number(r.expenses_total) || 0 },
+  { header: "الغرف", get: (r) => Number(r.revenue_rooms) || 0 },
+  { header: "الكوفى شوب", get: (r) => Number(r.revenue_coffee_shop) || 0 },
+  { header: "بار حمام السباحه", get: (r) => Number(r.revenue_pool_bar) || 0 },
+  { header: "الشاطئ", get: (r) => Number(r.revenue_beach) || 0 },
+  { header: "ايجارات", get: (r) => Number(r.revenue_rentals) || 0 },
+  { header: "اخرى", get: (r) => Number(r.revenue_other) || 0 },
+  { header: "اجمالى الايراد", get: (r) => Number(r.revenue_total) || 0 },
+  { header: "صافى اليوم", get: (r) => (Number(r.revenue_total) || 0) - (Number(r.expenses_total) || 0) },
+];
+
+function FinanceHistoryTab({ rows, hotelId, token }) {
   const chartRows = useMemo(() => [...rows].sort((a, b) => a.entry_date.localeCompare(b.entry_date)).slice(-31), [rows]);
   const monthTotal = useMemo(() => {
     const rev = chartRows.reduce((s, r) => s + (Number(r.revenue_total) || 0), 0);
@@ -4434,9 +5481,68 @@ function FinanceHistoryTab({ rows }) {
     return { rev, exp, net: rev - exp };
   }, [chartRows]);
 
+  const [fromDate, setFromDate] = useState(() => addDaysISO(todayISO(), -30));
+  const [toDate, setToDate] = useState(() => todayISO());
+  const [exporting, setExporting] = useState(false);
+  const [exportStatus, setExportStatus] = useState("");
+
+  const exportRange = async () => {
+    if (!hotelId) {
+      setExportStatus("❌ لا يوجد hotel مرتبط بالحساب.");
+      return;
+    }
+    if (fromDate > toDate) {
+      setExportStatus("❌ تاريخ البداية بعد تاريخ النهاية.");
+      return;
+    }
+    setExporting(true);
+    setExportStatus("جاري تجهيز الملف…");
+    try {
+      const data = await supabaseRest(
+        `finance_daily?hotel_id=eq.${hotelId}&entry_date=gte.${fromDate}&entry_date=lte.${toDate}&order=entry_date.asc`,
+        { accessToken: token }
+      );
+      if (!data || data.length === 0) {
+        setExportStatus("لا توجد بيانات محفوظة فى الفترة دى.");
+        setExporting(false);
+        return;
+      }
+      const aoa = [
+        FINANCE_EXPORT_COLUMNS.map((c) => c.header),
+        ...data.map((r) => FINANCE_EXPORT_COLUMNS.map((c) => c.get(r))),
+      ];
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws["!cols"] = FINANCE_EXPORT_COLUMNS.map(() => ({ wch: 16 }));
+      if (!ws["!views"]) ws["!views"] = [{ rightToLeft: true }];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, `${fromDate}_${toDate}`.slice(0, 31));
+      XLSX.writeFile(wb, `finance_${fromDate}_to_${toDate}.xlsx`);
+      setExportStatus(`🎯 تم تصدير ${data.length} يوم.`);
+    } catch (e) {
+      setExportStatus(`❌ تعذر التصدير: ${e.message}`);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <div>
       <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", marginBottom: "0.5rem" }}>History & chart</h2>
+
+      <div style={{ ...cardStyle, marginBottom: "1rem", display: "flex", gap: "0.75rem", flexWrap: "wrap", alignItems: "flex-end" }}>
+        <div>
+          <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, marginBottom: 4 }}>من تاريخ</div>
+          <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} style={inputStyle} />
+        </div>
+        <div>
+          <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, marginBottom: 4 }}>إلى تاريخ</div>
+          <input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)} style={inputStyle} />
+        </div>
+        <button onClick={exportRange} disabled={exporting} style={primaryBtn}>
+          {exporting ? "جاري التصدير…" : "تصدير Excel"}
+        </button>
+        {exportStatus && <div style={{ fontSize: "0.8rem", color: TOKENS.inkSoft }}>{exportStatus}</div>}
+      </div>
 
       <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "1rem" }}>
         <div style={{ ...cardStyle, flex: 1, minWidth: 160 }}>
@@ -4489,403 +5595,6 @@ function FinanceHistoryTab({ rows }) {
 
 const thStyle = { textAlign: "right", padding: "4px 8px", borderBottom: `1px solid ${TOKENS.paperDim}`, color: TOKENS.inkSoft, fontWeight: 600, whiteSpace: "nowrap" };
 const tdStyle = { textAlign: "right", padding: "4px 8px", borderBottom: `1px solid ${TOKENS.paperDim}`, whiteSpace: "nowrap" };
-
-// ---- Accountant report (manager-facing analysis of finance_daily) ----
-// Read-only for the manager: pulls the same finance_daily rows the
-// accountant enters/imports and turns them into an analyzed report —
-// totals, category breakdowns, month-over-month trend, best/worst days,
-// and a data-quality check against the accountant's own reported totals.
-function financeMonthKey(dateISO) {
-  return dateISO.slice(0, 7); // YYYY-MM
-}
-function financeMonthLabel(monthKey) {
-  const [y, m] = monthKey.split("-").map(Number);
-  return new Date(y, m - 1, 1).toLocaleDateString("en-GB", { month: "short", year: "numeric" });
-}
-
-function CategoryBarList({ title, fields, rows, color }) {
-  const totals = useMemo(() => {
-    const sums = fields.map((f) => ({
-      key: f.key,
-      label: f.label,
-      value: rows.reduce((s, r) => s + (Number(r[f.key]) || 0), 0),
-    }));
-    const grand = sums.reduce((s, f) => s + f.value, 0);
-    return { sums: sums.sort((a, b) => b.value - a.value), grand };
-  }, [fields, rows]);
-
-  return (
-    <div style={{ ...cardStyle, flex: 1, minWidth: 280 }}>
-      <div style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.75rem" }}>{title}</div>
-      {totals.grand <= 0 ? (
-        <div style={{ color: TOKENS.inkSoft, fontSize: "0.8rem" }}>لا توجد بيانات فى هذه الفترة.</div>
-      ) : (
-        totals.sums.map((f) => {
-          const pct = totals.grand > 0 ? (f.value / totals.grand) * 100 : 0;
-          return (
-            <div key={f.key} style={{ marginBottom: "0.5rem" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.78rem", marginBottom: 2 }}>
-                <span>{f.label}</span>
-                <span style={{ color: TOKENS.inkSoft }}>
-                  {f.value.toLocaleString()} ({pct.toFixed(1)}%)
-                </span>
-              </div>
-              <div style={{ background: TOKENS.paperDim, borderRadius: 4, height: 8, overflow: "hidden" }}>
-                <div style={{ width: `${pct}%`, background: color, height: "100%" }} />
-              </div>
-            </div>
-          );
-        })
-      )}
-    </div>
-  );
-}
-
-function AccountantReportTab({ supabaseSession }) {
-  const [rows, setRows] = useState([]);
-  const [loaded, setLoaded] = useState(false);
-  const [error, setError] = useState("");
-  const [rangeStart, setRangeStart] = useState(addDaysISO(todayISO(), -30));
-  const [rangeEnd, setRangeEnd] = useState(todayISO());
-
-  const hotelId = supabaseSession && supabaseSession.hotelId;
-  const token = supabaseSession && supabaseSession.access_token;
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      if (!hotelId) {
-        setLoaded(true);
-        return;
-      }
-      try {
-        const data = await supabaseRest(`finance_daily?hotel_id=eq.${hotelId}&order=entry_date.asc&limit=3000`, { accessToken: token });
-        if (!cancelled) setRows(data || []);
-      } catch (e) {
-        if (!cancelled) setError(`Couldn't load accountant data: ${e.message}`);
-      } finally {
-        if (!cancelled) setLoaded(true);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [hotelId, token]);
-
-  const filteredRows = useMemo(
-    () => rows.filter((r) => r.entry_date >= rangeStart && r.entry_date <= rangeEnd).sort((a, b) => a.entry_date.localeCompare(b.entry_date)),
-    [rows, rangeStart, rangeEnd]
-  );
-
-  const stats = useMemo(() => {
-    const rev = filteredRows.reduce((s, r) => s + (Number(r.revenue_total) || 0), 0);
-    const exp = filteredRows.reduce((s, r) => s + (Number(r.expenses_total) || 0), 0);
-    const net = rev - exp;
-    const days = filteredRows.length;
-    const margin = rev > 0 ? (net / rev) * 100 : 0;
-    let bestDay = null;
-    let worstDay = null;
-    filteredRows.forEach((r) => {
-      const n = (Number(r.revenue_total) || 0) - (Number(r.expenses_total) || 0);
-      if (!bestDay || n > bestDay.net) bestDay = { entry_date: r.entry_date, net: n };
-      if (!worstDay || n < worstDay.net) worstDay = { entry_date: r.entry_date, net: n };
-    });
-    return {
-      rev,
-      exp,
-      net,
-      days,
-      margin,
-      avgRev: days ? rev / days : 0,
-      avgExp: days ? exp / days : 0,
-      avgNet: days ? net / days : 0,
-      bestDay,
-      worstDay,
-    };
-  }, [filteredRows]);
-
-  const monthly = useMemo(() => {
-    const byMonth = {};
-    filteredRows.forEach((r) => {
-      const key = financeMonthKey(r.entry_date);
-      if (!byMonth[key]) byMonth[key] = { rev: 0, exp: 0, days: 0 };
-      byMonth[key].rev += Number(r.revenue_total) || 0;
-      byMonth[key].exp += Number(r.expenses_total) || 0;
-      byMonth[key].days += 1;
-    });
-    const keys = Object.keys(byMonth).sort();
-    return keys.map((key, i) => {
-      const m = byMonth[key];
-      const net = m.rev - m.exp;
-      const prev = i > 0 ? byMonth[keys[i - 1]] : null;
-      const prevNet = prev ? prev.rev - prev.exp : null;
-      const growth = prevNet ? ((net - prevNet) / Math.abs(prevNet)) * 100 : null;
-      return { key, label: financeMonthLabel(key), ...m, net, growth };
-    });
-  }, [filteredRows]);
-
-  // Flags rows where the accountant's own sheet total doesn't match the
-  // sum of the category columns we computed — a data-entry / import issue
-  // worth the manager's attention, not just a display quirk.
-  const mismatches = useMemo(() => {
-    return filteredRows.filter((r) => {
-      const revMismatch = r.revenue_reported_total != null && Math.abs(Number(r.revenue_reported_total) - Number(r.revenue_total)) > 1;
-      const expMismatch = r.expense_reported_total != null && Math.abs(Number(r.expense_reported_total) - Number(r.expenses_total)) > 1;
-      return revMismatch || expMismatch;
-    });
-  }, [filteredRows]);
-
-  const exportToExcel = () => {
-    const sheetRows = filteredRows.map((r) => ({
-      "التاريخ": r.entry_date,
-      "الغرف": r.revenue_rooms,
-      "الكوفى شوب": r.revenue_coffee_shop,
-      "بار / حمام السباحة": r.revenue_pool_bar,
-      "الشاطئ": r.revenue_beach,
-      "إيجارات": r.revenue_rentals,
-      "إيرادات أخرى": r.revenue_other,
-      "إجمالى الإيراد": r.revenue_total,
-      "مصاريف تشغيل": r.expense_operating,
-      "مرتبات": r.expense_salaries,
-      "جارى الشريك": r.expense_partner_current,
-      "إيداع البنك": r.expense_bank_deposit,
-      "سلف الأسطاف": r.expense_staff_advances,
-      "مصاريف ثابتة": r.expense_fixed,
-      "مصاريف أخرى": r.expense_other,
-      "إجمالى المصروفات": r.expenses_total,
-      "صافى اليوم": (Number(r.revenue_total) || 0) - (Number(r.expenses_total) || 0),
-    }));
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(sheetRows), "Daily");
-    XLSX.utils.book_append_sheet(
-      wb,
-      XLSX.utils.json_to_sheet(
-        monthly.map((m) => ({ "الشهر": m.label, "الإيراد": m.rev, "المصروفات": m.exp, "الصافى": m.net, "أيام مسجلة": m.days }))
-      ),
-      "Monthly"
-    );
-    XLSX.writeFile(wb, `accountant-report_${rangeStart}_to_${rangeEnd}.xlsx`);
-  };
-
-  if (!loaded) return <div style={{ color: TOKENS.inkSoft }}>Loading…</div>;
-
-  if (!hotelId) {
-    return <div style={{ color: TOKENS.inkSoft }}>Sign in with a real manager account to view the accountant report.</div>;
-  }
-
-  return (
-    <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "0.75rem", marginBottom: "0.75rem" }}>
-        <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", margin: 0 }}>Accountant report</h2>
-        <button
-          onClick={exportToExcel}
-          disabled={!filteredRows.length}
-          style={{
-            background: TOKENS.ink,
-            color: TOKENS.paper,
-            border: "none",
-            borderRadius: 8,
-            padding: "0.5rem 1rem",
-            fontSize: "0.8rem",
-            cursor: filteredRows.length ? "pointer" : "not-allowed",
-            opacity: filteredRows.length ? 1 : 0.5,
-          }}
-        >
-          تصدير Excel
-        </button>
-      </div>
-
-      {error && <div style={{ background: TOKENS.oosBg, color: TOKENS.oos, padding: "0.5rem 1rem", borderRadius: 8, fontSize: "0.85rem", marginBottom: "0.75rem" }}>{error}</div>}
-
-      <div style={{ ...cardStyle, display: "flex", gap: "1rem", flexWrap: "wrap", alignItems: "flex-end", marginBottom: "1rem" }}>
-        <label style={{ display: "flex", flexDirection: "column", fontSize: "0.75rem", color: TOKENS.inkSoft, gap: 4 }}>
-          من تاريخ
-          <input type="date" value={rangeStart} max={rangeEnd} onChange={(e) => setRangeStart(e.target.value)} style={{ padding: "0.4rem", borderRadius: 6, border: `1px solid ${TOKENS.paperDim}` }} />
-        </label>
-        <label style={{ display: "flex", flexDirection: "column", fontSize: "0.75rem", color: TOKENS.inkSoft, gap: 4 }}>
-          إلى تاريخ
-          <input type="date" value={rangeEnd} min={rangeStart} onChange={(e) => setRangeEnd(e.target.value)} style={{ padding: "0.4rem", borderRadius: 6, border: `1px solid ${TOKENS.paperDim}` }} />
-        </label>
-        <div style={{ display: "flex", gap: "0.4rem" }}>
-          {[
-            { label: "7d", days: 7 },
-            { label: "30d", days: 30 },
-            { label: "90d", days: 90 },
-          ].map((p) => (
-            <button
-              key={p.label}
-              onClick={() => {
-                setRangeEnd(todayISO());
-                setRangeStart(addDaysISO(todayISO(), -p.days));
-              }}
-              style={{ border: `1px solid ${TOKENS.paperDim}`, background: "#fff", borderRadius: 6, padding: "0.3rem 0.6rem", fontSize: "0.75rem", cursor: "pointer" }}
-            >
-              {p.label}
-            </button>
-          ))}
-        </div>
-        <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>{stats.days} يوم مسجل فى هذه الفترة</div>
-      </div>
-
-      {/* Top-line summary */}
-      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "1rem" }}>
-        <div style={{ ...cardStyle, flex: 1, minWidth: 150 }}>
-          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>إجمالى الإيرادات</div>
-          <div style={{ fontSize: "1.4rem", fontWeight: 700, color: TOKENS.clean }}>{stats.rev.toLocaleString()}</div>
-        </div>
-        <div style={{ ...cardStyle, flex: 1, minWidth: 150 }}>
-          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>إجمالى المصروفات</div>
-          <div style={{ fontSize: "1.4rem", fontWeight: 700, color: TOKENS.oos }}>{stats.exp.toLocaleString()}</div>
-        </div>
-        <div style={{ ...cardStyle, flex: 1, minWidth: 150 }}>
-          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>صافى الربح</div>
-          <div style={{ fontSize: "1.4rem", fontWeight: 700, color: stats.net >= 0 ? TOKENS.clean : TOKENS.oos }}>{stats.net.toLocaleString()}</div>
-        </div>
-        <div style={{ ...cardStyle, flex: 1, minWidth: 150 }}>
-          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>هامش الربح</div>
-          <div style={{ fontSize: "1.4rem", fontWeight: 700, color: stats.margin >= 0 ? TOKENS.clean : TOKENS.oos }}>{stats.margin.toFixed(1)}%</div>
-        </div>
-      </div>
-
-      {/* Averages + best/worst */}
-      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "1rem" }}>
-        <div style={{ ...cardStyle, flex: 1, minWidth: 200 }}>
-          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft, marginBottom: 4 }}>متوسط اليوم</div>
-          <div style={{ fontSize: "0.85rem" }}>إيراد: {stats.avgRev.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
-          <div style={{ fontSize: "0.85rem" }}>مصروف: {stats.avgExp.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
-          <div style={{ fontSize: "0.85rem" }}>صافى: {stats.avgNet.toLocaleString(undefined, { maximumFractionDigits: 0 })}</div>
-        </div>
-        <div style={{ ...cardStyle, flex: 1, minWidth: 200 }}>
-          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft, marginBottom: 4 }}>أفضل يوم (صافى)</div>
-          {stats.bestDay ? (
-            <div style={{ fontSize: "0.9rem", color: TOKENS.clean, fontWeight: 600 }}>
-              {stats.bestDay.entry_date} — {stats.bestDay.net.toLocaleString()}
-            </div>
-          ) : (
-            <div style={{ color: TOKENS.inkSoft, fontSize: "0.8rem" }}>—</div>
-          )}
-        </div>
-        <div style={{ ...cardStyle, flex: 1, minWidth: 200 }}>
-          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft, marginBottom: 4 }}>أضعف يوم (صافى)</div>
-          {stats.worstDay ? (
-            <div style={{ fontSize: "0.9rem", color: stats.worstDay.net < 0 ? TOKENS.oos : TOKENS.ink, fontWeight: 600 }}>
-              {stats.worstDay.entry_date} — {stats.worstDay.net.toLocaleString()}
-            </div>
-          ) : (
-            <div style={{ color: TOKENS.inkSoft, fontSize: "0.8rem" }}>—</div>
-          )}
-        </div>
-      </div>
-
-      {/* Trend chart */}
-      {filteredRows.length > 0 ? (
-        <div style={{ ...cardStyle, marginBottom: "1rem" }}>
-          <div style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>الإيراد والمصروف اليومى</div>
-          <FinanceLineChart rows={filteredRows} />
-        </div>
-      ) : (
-        <div style={{ color: TOKENS.inkSoft, marginBottom: "1rem" }}>لا توجد بيانات محفوظة فى هذه الفترة.</div>
-      )}
-
-      {/* Category breakdown */}
-      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "1rem" }}>
-        <CategoryBarList title="الإيرادات حسب المصدر" fields={FINANCE_REVENUE_FIELDS} rows={filteredRows} color={TOKENS.clean} />
-        <CategoryBarList title="المصروفات حسب النوع" fields={FINANCE_EXPENSE_FIELDS} rows={filteredRows} color={TOKENS.oos} />
-      </div>
-
-      {/* Monthly comparison */}
-      {monthly.length > 0 && (
-        <div style={{ ...cardStyle, marginBottom: "1rem", overflowX: "auto" }}>
-          <div style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>مقارنة شهرية</div>
-          <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "0.8rem" }}>
-            <thead>
-              <tr>
-                <th style={thStyle}>الشهر</th>
-                <th style={thStyle}>الإيراد</th>
-                <th style={thStyle}>المصروفات</th>
-                <th style={thStyle}>الصافى</th>
-                <th style={thStyle}>التغيير عن الشهر السابق</th>
-              </tr>
-            </thead>
-            <tbody>
-              {monthly.map((m) => (
-                <tr key={m.key}>
-                  <td style={tdStyle}>{m.label}</td>
-                  <td style={tdStyle}>{m.rev.toLocaleString()}</td>
-                  <td style={tdStyle}>{m.exp.toLocaleString()}</td>
-                  <td style={{ ...tdStyle, color: m.net >= 0 ? TOKENS.clean : TOKENS.oos, fontWeight: 600 }}>{m.net.toLocaleString()}</td>
-                  <td style={tdStyle}>
-                    {m.growth === null ? "—" : `${m.growth >= 0 ? "+" : ""}${m.growth.toFixed(1)}%`}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* Data quality flags */}
-      {mismatches.length > 0 && (
-        <div style={{ ...cardStyle, marginBottom: "1rem", border: `1px solid ${TOKENS.oos}` }}>
-          <div style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem", color: TOKENS.oos }}>
-            تنبيه: {mismatches.length} يوم بإجمالى مُدخل لا يطابق مجموع البنود
-          </div>
-          <div style={{ overflowX: "auto" }}>
-            <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "0.78rem" }}>
-              <thead>
-                <tr>
-                  <th style={thStyle}>التاريخ</th>
-                  <th style={thStyle}>إيراد محسوب</th>
-                  <th style={thStyle}>إيراد مُدخل بالشيت</th>
-                  <th style={thStyle}>مصروف محسوب</th>
-                  <th style={thStyle}>مصروف مُدخل بالشيت</th>
-                </tr>
-              </thead>
-              <tbody>
-                {mismatches.map((r) => (
-                  <tr key={r.entry_date}>
-                    <td style={tdStyle}>{r.entry_date}</td>
-                    <td style={tdStyle}>{Number(r.revenue_total).toLocaleString()}</td>
-                    <td style={tdStyle}>{r.revenue_reported_total != null ? Number(r.revenue_reported_total).toLocaleString() : "—"}</td>
-                    <td style={tdStyle}>{Number(r.expenses_total).toLocaleString()}</td>
-                    <td style={tdStyle}>{r.expense_reported_total != null ? Number(r.expense_reported_total).toLocaleString() : "—"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* Daily detail */}
-      <div style={{ ...cardStyle, overflowX: "auto" }}>
-        <div style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: "0.5rem" }}>التفاصيل اليومية</div>
-        <table style={{ borderCollapse: "collapse", width: "100%", fontSize: "0.8rem" }}>
-          <thead>
-            <tr>
-              <th style={thStyle}>التاريخ</th>
-              <th style={thStyle}>إجمالى الإيراد</th>
-              <th style={thStyle}>إجمالى المصروفات</th>
-              <th style={thStyle}>صافى اليوم</th>
-            </tr>
-          </thead>
-          <tbody>
-            {[...filteredRows].reverse().map((r) => (
-              <tr key={r.entry_date}>
-                <td style={tdStyle}>{r.entry_date}</td>
-                <td style={tdStyle}>{Number(r.revenue_total).toLocaleString()}</td>
-                <td style={tdStyle}>{Number(r.expenses_total).toLocaleString()}</td>
-                <td style={{ ...tdStyle, color: (Number(r.revenue_total) - Number(r.expenses_total)) >= 0 ? TOKENS.clean : TOKENS.oos }}>
-                  {(Number(r.revenue_total) - Number(r.expenses_total)).toLocaleString()}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
 
 function UsersTab({ extraUsers, onAddUser, onDeleteUser, supabaseSession }) {
   const [form, setForm] = useState({ email: "", displayName: "", password: "", role: "reception" });

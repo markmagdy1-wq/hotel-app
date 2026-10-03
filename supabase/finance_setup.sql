@@ -25,7 +25,10 @@ create table if not exists public.finance_daily (
   -- expense breakdown
   expense_operating numeric not null default 0,
   expense_salaries numeric not null default 0,
-  expense_partner_current numeric not null default 0,
+  expense_partner_magdy numeric not null default 0,
+  expense_partner_moheb numeric not null default 0,
+  expense_partner_bola numeric not null default 0,
+  expense_partner_kamel numeric not null default 0,
   expense_bank_deposit numeric not null default 0,
   expense_staff_advances numeric not null default 0,
   expense_fixed numeric not null default 0,
