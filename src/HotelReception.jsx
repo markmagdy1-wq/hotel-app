@@ -637,22 +637,43 @@ const FONT_LINK = "https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9
 // switch:  [switch:<bookingId>] 2026-10-03 · Room 201 → 105 · reason
 // Everything else in `notes` is the guest's normal free-text note.
 const SWITCH_NOTE_RE = /^\[switch:([^\]]+)\]\s*(.*)$/;
+const TAG_NOTE_RE = /^\[tag:([a-z_]+)\]\s*$/;
 function splitGuestNotes(notes) {
   const plain = [];
   const switches = {};
+  const tags = [];
   String(notes || "")
     .split("\n")
     .forEach((line) => {
       const m = line.match(SWITCH_NOTE_RE);
+      const t = line.match(TAG_NOTE_RE);
       if (m) (switches[m[1]] = switches[m[1]] || []).push(m[2]);
+      else if (t) tags.push(t[1]);
       else if (line.trim()) plain.push(line);
     });
-  return { plain: plain.join("\n"), switches };
+  return { plain: plain.join("\n"), switches, tags };
+}
+// Guest tags (vip, blacklisted) live in the same notes column, one "[tag:x]" line each.
+function setGuestTags(notes, tags) {
+  const kept = String(notes || "")
+    .split("\n")
+    .filter((l) => !TAG_NOTE_RE.test(l));
+  const base = kept.join("\n").replace(/\s+$/, "");
+  const lines = tags.map((t) => `[tag:${t}]`).join("\n");
+  return [base, lines].filter(Boolean).join("\n");
 }
 function appendSwitchNote(notes, bookingId, text) {
   const base = String(notes || "").replace(/\s+$/, "");
   const line = `[switch:${bookingId}] ${text.replace(/\s*\n\s*/g, " ")}`;
   return base ? `${base}\n${line}` : line;
+}
+
+// Check-in is only allowed from the check-in date up to (not including) the check-out date.
+function checkInBlockReason(b, today = todayISO()) {
+  if (today < b.checkIn) return `Check-in not allowed before ${fmtDateY(b.checkIn)}`;
+  if (today > b.checkOut) return "This reservation has expired";
+  if (today === b.checkOut) return "This reservation ends today — it can't be checked in on its check-out date";
+  return null;
 }
 
 function roomLabel(n) {
@@ -956,42 +977,6 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
     if (supabaseSession) loadStaffList();
   }, [supabaseSession]);
 
-  const addTicket = async ({ persons, amountPaid, date, notes }) => {
-    if (supabaseSession) {
-      try {
-        const [inserted] = await supabaseRest("tickets", {
-          accessToken: supabaseSession.access_token,
-          method: "POST",
-          body: {
-            hotel_id: supabaseSession.hotelId,
-            persons: Number(persons) || 1,
-            amount_paid: Number(amountPaid) || 0,
-            ticket_date: date || todayISO(),
-            notes: notes || "",
-            created_by: supabaseSession.user.id,
-          },
-        });
-        setTickets((ts) => [...ts, mapTicketFromDb(inserted)]);
-      } catch (e) {
-        flashError(`Couldn't save ticket: ${e.message}`);
-      }
-      return;
-    }
-    const next = [
-      ...tickets,
-      {
-        id: uid(),
-        persons: Number(persons) || 1,
-        amountPaid: Number(amountPaid) || 0,
-        date: date || todayISO(),
-        notes: notes || "",
-        createdBy: username,
-      },
-    ];
-    setTickets(next);
-    persist({ tickets: next });
-  };
-
   const deleteTicket = async (id) => {
     if (supabaseSession) {
       try {
@@ -1102,6 +1087,11 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
   const checkIn = async (bookingId) => {
     const booking = bookings.find((b) => b.id === bookingId);
     if (!booking) return;
+    const blockedReason = checkInBlockReason(booking);
+    if (blockedReason) {
+      flashError(blockedReason);
+      return;
+    }
     if (!booking.roomNumber) {
       flashError("Choose a room for this booking first (Edit), then check in.");
       return;
@@ -1306,6 +1296,26 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
     persist({ bookings: nextBookings, rooms: nextRooms, guests: nextGuests });
   };
 
+  const updateGuestTags = async (guestId, tags) => {
+    const guest = guests.find((g) => g.id === guestId);
+    if (!guest) return;
+    const notes = setGuestTags(guest.notes, tags);
+    if (supabaseSession) {
+      try {
+        await supabasePatchChecked(`guests?id=eq.${guestId}`, {
+          accessToken: supabaseSession.access_token,
+          what: "Guest status",
+          body: { notes },
+        });
+        setGuests((gs) => gs.map((g) => (g.id === guestId ? { ...g, notes } : g)));
+      } catch (e) {
+        flashError(`Couldn't save guest status: ${e.message}`);
+      }
+      return;
+    }
+    updateGuests(guests.map((g) => (g.id === guestId ? { ...g, notes } : g)));
+  };
+
   const deleteBookingRecord = async (bookingId) => {
     if (supabaseSession) {
       try {
@@ -1396,10 +1406,11 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             setSelectedRoom((s) => ({ ...s, status: "occupied" }));
           }
         }
+        return true;
       } catch (e) {
         flashError(`Couldn't save booking: ${e.message}`);
+        return false;
       }
-      return;
     }
     let nextGuests = guests;
     let finalGuestId = guestId;
@@ -1434,6 +1445,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
     if (selectedRoom && selectedRoom.number === roomNumber && checkInNow) {
       setSelectedRoom({ ...selectedRoom, status: "occupied" });
     }
+    return true;
   };
 
   const roomsNeedingCleaning = useMemo(
@@ -1630,7 +1642,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             />
           )}
           {managerTab === "todayReport" && (
-            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} />
+            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} onCheckIn={checkIn} onCheckOut={checkOut} />
           )}
           {managerTab === "pricing" && (
             <RoomPricingTab
@@ -1887,7 +1899,6 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
           { id: "bookings", label: "Bookings" },
           { id: "guests", label: "Guests" },
           { id: "housekeeping", label: "Housekeeping" },
-          { id: "tickets", label: "Tickets" },
           { id: "todayReport", label: "Today report" },
         ].map((t) => (
           <button
@@ -1942,6 +1953,8 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             checkoutCounts={checkoutCounts}
             roomRates={roomRates}
             bookings={bookings}
+            onCheckIn={checkIn}
+            onQuickClean={(number) => setRoomStatus(number, "vacant_clean", "")}
           />
         )}
         {tab === "bookings" && (
@@ -1979,6 +1992,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             }}
             bookings={bookings}
             rooms={rooms}
+            onUpdateTags={updateGuestTags}
           />
         )}
         {tab === "housekeeping" && (
@@ -1991,11 +2005,11 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             activeBookingForRoom={activeBookingForRoom}
             guestName={guestName}
             onMarkCleanedToday={markCleanedToday}
+            bookings={bookings}
           />
         )}
-        {tab === "tickets" && <TicketsTab tickets={tickets} onAddTicket={addTicket} />}
         {tab === "todayReport" && (
-          <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} />
+          <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} onCheckIn={checkIn} onCheckOut={checkOut} />
         )}
       </main>
 
@@ -2042,60 +2056,85 @@ function Pill({ status }) {
   );
 }
 
-function RoomsTab({ rooms, counts, onSelect, activeBookingForRoom, guestName, checkoutCounts, roomRates, bookings }) {
-  const floors = [...new Set(rooms.map((r) => r.floor))].sort();
-  const maintenanceCount = rooms.filter(
-    (r) => (checkoutCounts[r.number] || 0) - (r.maintenanceBaseline || 0) >= MAINTENANCE_THRESHOLD
-  ).length;
+// ───────────────────────── Rooms page (rack) ─────────────────────────
+
+const ROOMS_CSS = `
+@keyframes rkPop { from { opacity: 0; transform: translateY(8px) scale(.98) } to { opacity: 1; transform: none } }
+@keyframes rkSlideRight { from { transform: translateX(100%) } to { transform: translateX(0) } }
+.rk-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: .75rem; }
+@media (max-width: 1023px) { .rk-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 639px) { .rk-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .6rem; } }
+.rk-card { position: relative; overflow: hidden; cursor: pointer; animation: rkPop .28s ease-out both; transition: box-shadow .15s, transform .15s; }
+.rk-card:hover, .rk-card:focus-visible { box-shadow: 0 8px 22px rgba(27,36,48,.14); transform: translateY(-2px); outline: none; }
+.rk-actions { position: absolute; left: 0; right: 0; bottom: 0; display: flex; gap: 5px; padding: 22px 8px 8px; background: linear-gradient(to top, rgba(255,255,255,.98) 62%, rgba(255,255,255,0)); opacity: 0; transform: translateY(8px); transition: opacity .15s, transform .15s; pointer-events: none; }
+.rk-card:hover .rk-actions, .rk-card:focus-within .rk-actions { opacity: 1; transform: none; pointer-events: auto; }
+@media (hover: none) { .rk-actions { display: none; } }
+.rk-act { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 4px; border: 1px solid #EAE1D2; background: #fff; color: #3A4556; border-radius: 8px; padding: 5px 4px; font-size: .68rem; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.rk-act:hover { background: #F5EFE6; }
+.rk-act.primary { background: #1B2430; color: #F5EFE6; border-color: #1B2430; }
+.rk-act.primary:hover { background: #2a3646; }
+.rk-kpi { text-align: left; cursor: pointer; border: 1px solid rgba(255,255,255,.9); background: rgba(255,255,255,.62); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border-radius: 14px; padding: .7rem .8rem; display: flex; align-items: center; gap: 10px; transition: transform .15s, box-shadow .15s, background .15s; box-shadow: 0 2px 10px rgba(27,36,48,.05); font-family: inherit; }
+.rk-kpi:hover { transform: translateY(-1px); background: rgba(255,255,255,.85); }
+.rk-kpi:focus-visible { outline: 2px solid #B08968; outline-offset: 2px; }
+`;
+
+const ORDINALS = ["th", "st", "nd", "rd"];
+function floorLabel(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return `Floor ${n}`;
+  const mod = v % 100;
+  const suffix = ORDINALS[(mod - 20) % 10] || ORDINALS[mod] || ORDINALS[0];
+  return `${v}${suffix} Floor`;
+}
+const ROOM_SHORT_STATUS = { vacant_clean: "Vacant", vacant_dirty: "Needs cleaning", occupied: "Occupied", out_of_order: "Out of order" };
+
+function RoomsTab({ rooms, counts, onSelect, activeBookingForRoom, guestName, checkoutCounts, roomRates, bookings, onCheckIn, onQuickClean }) {
+  const [filter, setFilter] = useState(null);
+  const today = todayISO();
+  const floors = [...new Set(rooms.map((r) => r.floor))].sort((a, b) => Number(a) - Number(b));
+  const isMaint = (r) => (checkoutCounts[r.number] || 0) - (r.maintenanceBaseline || 0) >= MAINTENANCE_THRESHOLD;
+  const maintenanceCount = rooms.filter(isMaint).length;
+  const matches = (r) => !filter || (filter === "maintenance" ? isMaint(r) : r.status === filter);
+  const shown = rooms.filter(matches).length;
+
+  const kpis = [
+    { key: "vacant_clean", label: "Vacant · clean", icon: "check", color: TOKENS.clean, bg: TOKENS.cleanBg, n: counts.vacant_clean || 0 },
+    { key: "occupied", label: "Occupied", icon: "bed", color: TOKENS.occupied, bg: TOKENS.occupiedBg, n: counts.occupied || 0 },
+    { key: "vacant_dirty", label: "Needs cleaning", icon: "sparkles", color: TOKENS.dirty, bg: TOKENS.dirtyBg, n: counts.vacant_dirty || 0 },
+    { key: "out_of_order", label: "Out of order", icon: "ban", color: TOKENS.oos, bg: TOKENS.oosBg, n: counts.out_of_order || 0 },
+    { key: "maintenance", label: "Needs maintenance", icon: "wrench", color: TOKENS.oos, bg: TOKENS.oosBg, n: maintenanceCount },
+  ];
+
   return (
     <div>
-      <div style={{ display: "flex", gap: "0.75rem", marginBottom: "1.5rem", flexWrap: "wrap" }}>
-        {Object.entries(STATUS_META).map(([key, meta]) => (
-          <div
-            key={key}
-            style={{
-              background: "#fff",
-              border: `1px solid ${TOKENS.paperDim}`,
-              borderRadius: 10,
-              padding: "0.6rem 0.9rem",
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              flex: "1 1 140px",
-            }}
-          >
-            <span style={{ width: 10, height: 10, borderRadius: "50%", background: meta.color }} />
-            <div>
-              <div style={{ fontSize: "1.1rem", fontWeight: 600, fontFamily: "Fraunces, serif" }}>
-                {counts[key] || 0}
-              </div>
-              <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft }}>{meta.label}</div>
-            </div>
-          </div>
-        ))}
-        <div
-          style={{
-            background: "#fff",
-            border: `1px solid ${TOKENS.oos}`,
-            borderRadius: 10,
-            padding: "0.6rem 0.9rem",
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            flex: "1 1 140px",
-          }}
-        >
-          <span style={{ width: 10, height: 10, borderRadius: "50%", background: TOKENS.oos }} />
-          <div>
-            <div style={{ fontSize: "1.1rem", fontWeight: 600, fontFamily: "Fraunces, serif", color: TOKENS.oos }}>
-              {maintenanceCount}
-            </div>
-            <div style={{ fontSize: "0.7rem", color: TOKENS.oos }}>Needs maintenance</div>
-          </div>
+      <style>{ROOMS_CSS}</style>
+
+      <div style={{ background: "linear-gradient(135deg, rgba(176,137,104,.22), rgba(68,85,105,.12))", borderRadius: 18, padding: 10, marginBottom: "1rem" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8 }}>
+          {kpis.map((k) => {
+            const active = filter === k.key;
+            return (
+              <button
+                key={k.key}
+                className="rk-kpi"
+                onClick={() => setFilter(active ? null : k.key)}
+                aria-pressed={active}
+                style={{ borderColor: active ? k.color : undefined, boxShadow: active ? `0 0 0 2px ${k.color}33, 0 6px 16px rgba(27,36,48,.08)` : undefined, background: active ? "rgba(255,255,255,.95)" : undefined }}
+              >
+                <span style={{ width: 34, height: 34, borderRadius: 10, background: k.bg, color: k.color, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <Ico name={k.icon} size={17} />
+                </span>
+                <span style={{ minWidth: 0 }}>
+                  <span style={{ display: "block", fontSize: "1.35rem", fontWeight: 700, fontFamily: "Fraunces, serif", lineHeight: 1.1, color: TOKENS.ink }}>{k.n}</span>
+                  <span style={{ display: "block", fontSize: "0.7rem", color: TOKENS.inkSoft, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{k.label}</span>
+                </span>
+              </button>
+            );
+          })}
         </div>
       </div>
 
-      <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", marginBottom: "1.5rem", fontSize: "0.72rem", color: TOKENS.inkSoft }}>
+      <div style={{ display: "flex", gap: "0.9rem", flexWrap: "wrap", alignItems: "center", marginBottom: "1.25rem", fontSize: "0.72rem", color: TOKENS.inkSoft }}>
         {[
           { color: "#D9A527", label: "Checking out today" },
           { color: TOKENS.oos, label: "Occupied" },
@@ -2108,127 +2147,142 @@ function RoomsTab({ rooms, counts, onSelect, activeBookingForRoom, guestName, ch
             {item.label}
           </div>
         ))}
+        {filter && (
+          <button className="gx-btn" onClick={() => setFilter(null)} style={{ ...ghostBtn, marginLeft: "auto", padding: "0.25rem 0.65rem", fontSize: "0.72rem", display: "inline-flex", alignItems: "center", gap: 5 }}>
+            Showing {shown} room{shown === 1 ? "" : "s"} <Ico name="x" size={12} /> Clear
+          </button>
+        )}
       </div>
 
-      {floors.map((floor) => (
-        <div key={floor} style={{ marginBottom: "1.75rem" }}>
-          <div
-            style={{
-              fontSize: "0.75rem",
-              letterSpacing: "0.1em",
-              textTransform: "uppercase",
-              color: TOKENS.brassDark,
-              marginBottom: "0.6rem",
-              fontWeight: 600,
-            }}
-          >
-            {floor}00 rooms
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))", gap: "0.75rem" }}>
-            {rooms
-              .filter((r) => r.floor === floor)
-              .map((room) => {
+      {shown === 0 && (
+        <div style={{ ...cardStyle, textAlign: "center", padding: "2rem 1rem", color: TOKENS.inkSoft }}>
+          No rooms match this filter.{" "}
+          <button onClick={() => setFilter(null)} style={{ ...ghostBtn, marginLeft: 6 }}>
+            Show all rooms
+          </button>
+        </div>
+      )}
+
+      {floors.map((floor) => {
+        const floorRooms = rooms.filter((r) => r.floor === floor);
+        const visible = floorRooms.filter(matches);
+        if (visible.length === 0) return null;
+        const usable = floorRooms.filter((r) => r.status !== "out_of_order").length;
+        const occ = floorRooms.filter((r) => r.status === "occupied").length;
+        const pct = usable ? Math.round((occ / usable) * 100) : 0;
+        return (
+          <div key={floor} style={{ marginBottom: "1.75rem" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: "0.7rem", flexWrap: "wrap" }}>
+              <div style={{ fontFamily: "Fraunces, serif", fontSize: "1.05rem", fontWeight: 600 }}>{floorLabel(floor)}</div>
+              <div style={{ flex: "1 1 120px", maxWidth: 260, height: 6, background: TOKENS.paperDim, borderRadius: 999, overflow: "hidden" }} role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100} aria-label={`${floorLabel(floor)} occupancy`}>
+                <div style={{ width: `${pct}%`, height: "100%", background: `linear-gradient(90deg, ${TOKENS.brass}, ${TOKENS.occupied})`, borderRadius: 999, transition: "width .4s ease" }} />
+              </div>
+              <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>
+                {occ}/{usable} occupied · <strong style={{ color: TOKENS.ink }}>{pct}%</strong>
+              </div>
+            </div>
+            <div className="rk-grid" key={filter || "all"}>
+              {visible.map((room, idx) => {
                 const meta = STATUS_META[room.status];
                 const booking = activeBookingForRoom(room.number);
-                const needsMaintenance = (checkoutCounts[room.number] || 0) - (room.maintenanceBaseline || 0) >= MAINTENANCE_THRESHOLD;
-                const today = todayISO();
+                const needsMaintenance = isMaint(room);
                 const checkoutToday = booking && booking.checkOut === today;
-                const checkinToday =
-                  !booking && bookings.some((b) => b.roomNumber === room.number && b.status === "reserved" && b.checkIn === today);
+                const arriving = !booking ? bookings.find((b) => b.roomNumber === room.number && b.status === "reserved" && b.checkIn === today) : null;
                 const isOccupied = room.status === "occupied";
                 const needsCleaning = room.status === "vacant_dirty";
                 let dotColor = meta.color;
-                if (checkoutToday) dotColor = "#D9A527"; // yellow — checking out today
-                else if (isOccupied) dotColor = TOKENS.oos; // red — occupied
-                else if (checkinToday) dotColor = TOKENS.clean; // green — arriving today, not checked in yet
-                else if (needsMaintenance) dotColor = TOKENS.dirty; // orange — needs maintenance
-                else if (needsCleaning) dotColor = "#3B6FA0"; // blue — needs cleaning
+                if (checkoutToday) dotColor = "#D9A527";
+                else if (isOccupied) dotColor = TOKENS.oos;
+                else if (arriving) dotColor = TOKENS.clean;
+                else if (needsMaintenance) dotColor = TOKENS.dirty;
+                else if (needsCleaning) dotColor = "#3B6FA0";
+                const canCheckIn = !!arriving && (room.status === "vacant_clean" || room.status === "vacant_dirty");
+                const stop = (fn) => (e) => {
+                  e.stopPropagation();
+                  fn();
+                };
                 return (
-                  <button
-                    key={room.number}
+                  <div
+                    key={room.number + (filter || "")}
+                    className="rk-card"
+                    role="button"
+                    tabIndex={0}
                     onClick={() => onSelect(room)}
+                    onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), onSelect(room))}
+                    aria-label={`Room ${room.number}, ${meta.label}`}
                     style={{
-                      textAlign: "left",
-                      cursor: "pointer",
-                      border: "none",
-                      background: "transparent",
-                      padding: 0,
-                      position: "relative",
+                      background: "#fff",
+                      border: `1px solid ${TOKENS.paperDim}`,
+                      borderTop: `3px solid ${meta.color}`,
+                      borderRadius: 14,
+                      padding: "0.7rem 0.75rem 0.65rem",
+                      minHeight: 132,
+                      animationDelay: `${Math.min(idx, 12) * 18}ms`,
+                      boxShadow: "0 1px 2px rgba(27,36,48,0.05)",
                     }}
                   >
-                    <div
-                      title={
-                        checkoutToday
-                          ? "Checking out today"
-                          : isOccupied
-                          ? "Occupied"
-                          : checkinToday
-                          ? "Arriving today"
-                          : needsMaintenance
-                          ? "Needs maintenance"
-                          : needsCleaning
-                          ? "Needs cleaning"
-                          : undefined
-                      }
-                      style={{
-                        width: 20,
-                        height: 20,
-                        borderRadius: "50%",
-                        background: dotColor,
-                        border: `1px solid ${TOKENS.paperDim}`,
-                        margin: "0 auto -10px",
-                        position: "relative",
-                        zIndex: 1,
-                      }}
-                    />
-                    <div
-                      style={{
-                        background: "#fff",
-                        border: `1px solid ${TOKENS.paperDim}`,
-                        borderTop: `3px solid ${meta.color}`,
-                        borderRadius: 10,
-                        padding: "1rem 0.75rem 0.75rem",
-                        boxShadow: "0 1px 2px rgba(27,36,48,0.05)",
-                        position: "relative",
-                      }}
-                    >
-                      {needsMaintenance && (
+                    <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 6 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                         <span
-                          title={`Checked out ${checkoutCounts[room.number]} times — due for a maintenance check`}
-                          style={{
-                            position: "absolute",
-                            top: 8,
-                            right: 8,
-                            width: 8,
-                            height: 8,
-                            borderRadius: "50%",
-                            background: TOKENS.oos,
-                          }}
+                          title={checkoutToday ? "Checking out today" : isOccupied ? "Occupied" : arriving ? "Arriving today" : needsMaintenance ? "Needs maintenance" : needsCleaning ? "Needs cleaning" : undefined}
+                          style={{ width: 9, height: 9, borderRadius: "50%", background: dotColor, flexShrink: 0 }}
                         />
-                      )}
-                      <div style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", fontWeight: 600 }}>
-                        {room.number}
+                        <span style={{ fontFamily: "Fraunces, serif", fontSize: "1.55rem", fontWeight: 700, lineHeight: 1 }}>{room.number}</span>
                       </div>
-                      <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft, marginBottom: 2 }}>{room.type}</div>
-                      <div style={{ fontSize: "0.68rem", color: TOKENS.inkSoft, marginBottom: 8 }}>{fmtMoney(getRoomRate(room, roomRates))}/night</div>
-                      <Pill status={room.status} />
-                      {needsMaintenance && (
-                        <div style={{ fontSize: "0.68rem", color: TOKENS.oos, marginTop: 6, fontWeight: 500 }}>
-                          Due for maintenance check
-                        </div>
-                      )}
-                      {booking && (
-                        <div style={{ fontSize: "0.68rem", color: TOKENS.inkSoft, marginTop: 6 }}>
-                          {guestName(booking.guestId)}
-                        </div>
-                      )}
+                      <span style={{ fontSize: "0.64rem", fontWeight: 700, color: TOKENS.inkSoft, background: TOKENS.paper, borderRadius: 6, padding: "2px 6px", letterSpacing: "0.03em", whiteSpace: "nowrap" }}>
+                        {room.type}
+                      </span>
                     </div>
-                  </button>
+
+                    <div style={{ marginTop: 8 }}>
+                      <SoftBadge small color={meta.color} bg={meta.bg}>
+                        {ROOM_SHORT_STATUS[room.status] || meta.label}
+                      </SoftBadge>
+                    </div>
+
+                    <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginTop: 6 }}>{fmtMoney(getRoomRate(room, roomRates))}/night</div>
+
+                    {booking && (
+                      <div style={{ fontSize: "0.72rem", color: TOKENS.ink, marginTop: 5, display: "flex", alignItems: "center", gap: 5, minWidth: 0 }}>
+                        <Ico name="user" size={12} color={TOKENS.inkSoft} />
+                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{guestName(booking.guestId)}</span>
+                      </div>
+                    )}
+                    {!booking && arriving && (
+                      <div style={{ fontSize: "0.68rem", color: TOKENS.clean, marginTop: 5, display: "flex", alignItems: "center", gap: 5, minWidth: 0 }}>
+                        <Ico name="user" size={12} />
+                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>Arriving: {guestName(arriving.guestId)}</span>
+                      </div>
+                    )}
+                    {checkoutToday && <div style={{ fontSize: "0.66rem", color: "#9A7410", marginTop: 3, fontWeight: 600 }}>Checking out today</div>}
+                    {needsMaintenance && (
+                      <div title={`Checked out ${checkoutCounts[room.number]} times — due for a maintenance check`} style={{ fontSize: "0.66rem", color: TOKENS.oos, marginTop: 3, fontWeight: 600 }}>
+                        Maintenance due
+                      </div>
+                    )}
+
+                    <div className="rk-actions">
+                      {canCheckIn && (
+                        <button className="rk-act primary" onClick={stop(() => onCheckIn(arriving.id))} title="Check in the arriving guest">
+                          <Ico name="login" size={12} /> Check in
+                        </button>
+                      )}
+                      {needsCleaning && (
+                        <button className="rk-act" onClick={stop(() => onQuickClean(room.number))} title="Mark as clean">
+                          <Ico name="sparkles" size={12} /> Clean
+                        </button>
+                      )}
+                      <button className="rk-act" onClick={stop(() => onSelect(room))} title="View details">
+                        <Ico name="eye" size={12} /> Details
+                      </button>
+                    </div>
+                  </div>
                 );
               })}
+            </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -2255,6 +2309,11 @@ function RoomDrawer({ room, onClose, onSetStatus, booking, guestName, onCheckOut
   const canReserve = room.status === "vacant_clean" || room.status === "vacant_dirty";
   const occupancyOptions = occupancyOptionsForType(room.type);
   const showMealPlans = true;
+  const [confirmOut, setConfirmOut] = useState(false);
+  const roomHistory = useMemo(
+    () => allBookings.filter((b) => b.roomNumber === room.number).sort((a, b) => b.checkIn.localeCompare(a.checkIn)),
+    [allBookings, room.number]
+  );
 
   const [guestMode, setGuestMode] = useState(guests.length ? "existing" : "new");
   const [form, setForm] = useState({
@@ -2358,25 +2417,31 @@ function RoomDrawer({ room, onClose, onSetStatus, booking, guestName, onCheckOut
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
-          width: 380,
-          maxWidth: "92vw",
+          width: 420,
+          maxWidth: "100vw",
           background: TOKENS.paper,
           height: "100%",
-          padding: "1.5rem",
+          padding: "1.25rem",
           overflowY: "auto",
+          animation: "rkSlideRight .22s ease-out",
         }}
       >
-        <button
-          onClick={onClose}
-          style={{ border: "none", background: "none", cursor: "pointer", fontSize: "0.85rem", color: TOKENS.inkSoft, marginBottom: 12 }}
-        >
-          ← Close
-        </button>
-        <div style={{ fontFamily: "Fraunces, serif", fontSize: "2rem", fontWeight: 600 }}>{room.number}</div>
-        <div style={{ color: TOKENS.inkSoft, marginBottom: 12 }}>
-          {room.type} · Floor {room.floor} · {fmtMoney(getRoomRate(room, roomRates))}/night
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
+          <div>
+            <div style={{ fontFamily: "Fraunces, serif", fontSize: "2.2rem", fontWeight: 700, lineHeight: 1 }}>{room.number}</div>
+            <div style={{ color: TOKENS.inkSoft, marginTop: 6, fontSize: "0.85rem" }}>
+              {room.type} · {floorLabel(room.floor)} · {fmtMoney(getRoomRate(room, roomRates))}/night
+            </div>
+          </div>
+          <button className="gx-btn" onClick={onClose} aria-label="Close" style={{ ...ghostBtn, padding: "0.4rem", display: "inline-flex", background: "#fff" }}>
+            <Ico name="x" size={16} />
+          </button>
         </div>
-        <Pill status={room.status} />
+        <div style={{ marginBottom: 4 }}>
+          <SoftBadge color={STATUS_META[room.status].color} bg={STATUS_META[room.status].bg}>
+            {STATUS_META[room.status].label}
+          </SoftBadge>
+        </div>
 
         {needsMaintenance && (
           <div
@@ -2402,48 +2467,82 @@ function RoomDrawer({ room, onClose, onSetStatus, booking, guestName, onCheckOut
         )}
 
         {booking && (
-          <div style={{ marginTop: "1.25rem", background: "#fff", borderRadius: 10, padding: "0.9rem", border: `1px solid ${TOKENS.paperDim}` }}>
-            <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Current guest</div>
-            <div style={{ fontWeight: 600, marginBottom: 4 }}>{guestName(booking.guestId)}</div>
-            <div
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 5,
-                fontSize: "0.7rem",
-                fontWeight: 600,
-                color: bookingTypeMeta(booking.bookingType).color,
-                background: bookingTypeMeta(booking.bookingType).bg,
-                borderRadius: 999,
-                padding: "2px 8px",
-                marginBottom: 8,
-              }}
-            >
-              {bookingTypeMeta(booking.bookingType).label}
+          <div style={{ marginTop: "1.25rem", background: "#fff", borderRadius: 12, padding: "0.9rem", border: `1px solid ${TOKENS.paperDim}` }}>
+            <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft, marginBottom: 6, fontWeight: 600 }}>Active guest</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+              <span style={{ width: 32, height: 32, borderRadius: "50%", background: TOKENS.paper, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
+                <Ico name="user" size={16} color={TOKENS.inkSoft} />
+              </span>
+              <div style={{ fontWeight: 600, fontSize: "1rem" }}>{guestName(booking.guestId)}</div>
+            </div>
+            {(() => {
+              const g = guests.find((x) => x.id === booking.guestId);
+              const nn = nightsBetween(booking.checkIn, booking.checkOut);
+              return (
+                <div style={{ fontSize: "0.8rem", color: TOKENS.inkSoft, display: "flex", flexDirection: "column", gap: 4, marginBottom: 10 }}>
+                  {g && g.phone && (
+                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <Ico name="phone" size={12} /> {g.phone}
+                    </span>
+                  )}
+                  {g && g.email && (
+                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <Ico name="mail" size={12} /> {g.email}
+                    </span>
+                  )}
+                  {g && g.nationalId && (
+                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <Ico name="id" size={12} /> {g.nationalId}
+                    </span>
+                  )}
+                  <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <Ico name="calendar" size={12} /> {fmtDateY(booking.checkIn)} → {fmtDateY(booking.checkOut)}
+                    {nn > 0 ? ` · ${nn} night${nn === 1 ? "" : "s"}` : ""} · {booking.persons || 1} {(booking.persons || 1) === 1 ? "person" : "persons"}
+                  </span>
+                </div>
+              );
+            })()}
+            <div style={{ marginBottom: 10 }}>
+              <BookingBadges b={booking} small />
             </div>
             {booking.discountPercent > 0 && (
-              <div style={{ fontSize: "0.7rem", color: TOKENS.clean, marginBottom: 8 }}>
-                {booking.discountPercent}% discount applied
-              </div>
+              <div style={{ fontSize: "0.72rem", color: TOKENS.clean, marginBottom: 8 }}>{booking.discountPercent}% discount applied</div>
             )}
-            <div style={{ fontSize: "0.8rem", color: TOKENS.inkSoft, marginBottom: 10 }}>
-              {fmtDate(booking.checkIn)} → {fmtDate(booking.checkOut)}
-            </div>
             <button
-              onClick={() => onCheckOut(booking.id)}
-              style={{
-                width: "100%",
-                background: TOKENS.ink,
-                color: TOKENS.paper,
-                border: "none",
-                borderRadius: 8,
-                padding: "0.55rem",
-                cursor: "pointer",
-                fontWeight: 500,
-              }}
+              className="gx-btn"
+              onClick={() => setConfirmOut(true)}
+              style={{ width: "100%", background: TOKENS.ink, color: TOKENS.paper, border: "none", borderRadius: 8, padding: "0.55rem", cursor: "pointer", fontWeight: 500, display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6 }}
             >
-              Check out
+              <Ico name="logout" size={14} /> Check out
             </button>
+          </div>
+        )}
+
+        {!booking && (
+          <div style={{ marginTop: "1.25rem" }}>
+            <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft, marginBottom: 6, fontWeight: 600 }}>Quick status</div>
+            <div style={{ display: "flex", gap: 6 }}>
+              {[
+                { key: "vacant_clean", label: "Clean", icon: "check" },
+                { key: "vacant_dirty", label: "Needs cleaning", icon: "sparkles" },
+                { key: "out_of_order", label: "Out of order", icon: "ban" },
+              ].map((o) => {
+                const active = room.status === o.key;
+                const m = STATUS_META[o.key];
+                return (
+                  <button
+                    key={o.key}
+                    className="gx-btn"
+                    onClick={() => !active && onSetStatus(o.key)}
+                    aria-pressed={active}
+                    style={{ ...ghostBtn, flex: 1, padding: "0.5rem 0.3rem", fontSize: "0.72rem", display: "inline-flex", flexDirection: "column", alignItems: "center", gap: 3, background: active ? m.bg : "#fff", color: active ? m.color : TOKENS.inkSoft, borderColor: active ? m.color : TOKENS.paperDim, fontWeight: active ? 700 : 400 }}
+                  >
+                    <Ico name={o.icon} size={15} />
+                    {o.label}
+                  </button>
+                );
+              })}
+            </div>
           </div>
         )}
 
@@ -2638,15 +2737,173 @@ function RoomDrawer({ room, onClose, onSetStatus, booking, guestName, onCheckOut
           </div>
         )}
 
+        <div style={{ marginTop: "1.25rem" }}>
+          <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft, marginBottom: 6, fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+            <Ico name="history" size={13} /> Room history ({roomHistory.length})
+          </div>
+          {roomHistory.length === 0 ? (
+            <div style={{ fontSize: "0.8rem", color: TOKENS.inkSoft }}>No bookings on record for this room.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {roomHistory.slice(0, 8).map((hb) => {
+                const hm = BOOKING_STATUS_META[hb.status] || BOOKING_STATUS_META.reserved;
+                const ht = bookingTypeMeta(hb.bookingType);
+                return (
+                  <div key={hb.id} style={{ background: "#fff", border: `1px solid ${TOKENS.paperDim}`, borderRadius: 10, padding: "0.5rem 0.65rem" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                      <div style={{ fontWeight: 600, fontSize: "0.82rem", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{guestName(hb.guestId)}</div>
+                      <SoftBadge small color={hm.color} bg={hm.bg}>
+                        {hm.label}
+                      </SoftBadge>
+                    </div>
+                    <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft, marginTop: 2, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      {fmtDateY(hb.checkIn)} → {fmtDateY(hb.checkOut)}
+                      <SoftBadge small color={ht.color} bg={ht.bg}>
+                        {ht.label}
+                      </SoftBadge>
+                    </div>
+                  </div>
+                );
+              })}
+              {roomHistory.length > 8 && <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>+ {roomHistory.length - 8} older booking{roomHistory.length - 8 === 1 ? "" : "s"}</div>}
+            </div>
+          )}
+        </div>
+
         <div style={{ marginTop: "1.5rem" }} />
+      </div>
+
+      {confirmOut && booking && (
+        <ConfirmModal
+          title="Check out guest?"
+          message={`${guestName(booking.guestId)} will be checked out of room ${room.number}. The room will be marked as needing cleaning.`}
+          confirmLabel="Check out"
+          cancelLabel="Not yet"
+          onConfirm={() => {
+            setConfirmOut(false);
+            onCheckOut(booking.id);
+          }}
+          onClose={() => setConfirmOut(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ───────────────────────── Bookings page helpers ─────────────────────────
+
+const BOOKING_STATUS_META = {
+  reserved: { label: "Reserved", color: TOKENS.reserved, bg: TOKENS.reservedBg },
+  checked_in: { label: "In-House", color: TOKENS.clean, bg: TOKENS.cleanBg },
+  checked_out: { label: "Checked out", color: TOKENS.occupied, bg: TOKENS.occupiedBg },
+  cancelled: { label: "Cancelled", color: TOKENS.oos, bg: TOKENS.oosBg },
+};
+
+function shortRef(id) {
+  return "#" + String(id).replace(/-/g, "").slice(0, 6).toUpperCase();
+}
+
+function BookingBadges({ b, small }) {
+  const meta = BOOKING_STATUS_META[b.status] || BOOKING_STATUS_META.reserved;
+  const type = bookingTypeMeta(b.bookingType);
+  const today = todayISO();
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 5, alignItems: "center" }}>
+      <SoftBadge small={small} color={type.color} bg={type.bg}>
+        {type.label}
+      </SoftBadge>
+      {b.paymentMethod && (
+        <span style={{ fontSize: small ? "0.66rem" : "0.7rem", color: TOKENS.inkSoft, border: `1px solid ${TOKENS.paperDim}`, borderRadius: 999, padding: small ? "2px 7px" : "2px 8px" }}>
+          {paymentMethodLabel(b.paymentMethod)}
+        </span>
+      )}
+      {b.status === "checked_in" && b.checkOut === today && (
+        <SoftBadge small={small} color={TOKENS.dirty} bg={TOKENS.dirtyBg}>
+          Departs today
+        </SoftBadge>
+      )}
+      {b.status === "reserved" && b.checkIn === today && (
+        <SoftBadge small={small} color={TOKENS.reserved} bg={TOKENS.reservedBg}>
+          Arrives today
+        </SoftBadge>
+      )}
+    </div>
+  );
+}
+
+function BookingsSkeleton({ mobile }) {
+  const rows = Array.from({ length: 5 });
+  if (mobile) {
+    return (
+      <div>
+        {rows.map((_, i) => (
+          <div key={i} style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 8 }}>
+            <div className="gx-skel" style={{ height: 18, width: "40%" }} />
+            <div className="gx-skel" style={{ height: 14, width: "60%" }} />
+            <div className="gx-skel" style={{ height: 36, width: "100%" }} />
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return (
+    <div style={{ ...cardStyle, padding: 0 }}>
+      {rows.map((_, i) => (
+        <div key={i} style={{ display: "flex", gap: 16, padding: "1rem", borderTop: i ? `1px solid ${TOKENS.paperDim}` : "none" }}>
+          <div className="gx-skel" style={{ height: 16, flex: 1 }} />
+          <div className="gx-skel" style={{ height: 16, flex: 2 }} />
+          <div className="gx-skel" style={{ height: 16, flex: 2 }} />
+          <div className="gx-skel" style={{ height: 16, flex: 2 }} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ConfirmModal({ title, message, confirmLabel, cancelLabel = "Close", danger, onConfirm, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div style={modalOverlay} onClick={onClose} role="presentation">
+      <div role="alertdialog" aria-modal="true" aria-label={title} style={{ ...modalBox, width: 400 }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={{ fontFamily: "Fraunces, serif", fontSize: "1.15rem", margin: "0 0 0.5rem" }}>{title}</h3>
+        <div style={{ fontSize: "0.86rem", color: TOKENS.inkSoft, marginBottom: "1rem", lineHeight: 1.45 }}>{message}</div>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button className="gx-btn" onClick={onClose} style={ghostBtn}>
+            {cancelLabel}
+          </button>
+          <button className="gx-btn" onClick={onConfirm} style={{ ...primaryBtn, background: danger ? TOKENS.oos : TOKENS.ink }} autoFocus>
+            {confirmLabel}
+          </button>
+        </div>
       </div>
     </div>
   );
 }
 
-function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckIn, onCheckOut, onCancel, onUpdateBooking, onSwitchRoom, showNew, setShowNew, onReserve, roomRates, mealPlanRates }) {
+
+function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckIn, onCheckOut, onCancel, onUpdateBooking, onSwitchRoom, showNew, setShowNew, onReserve, roomRates, mealPlanRates, loading = false }) {
   const [editingId, setEditingId] = useState(null);
   const [switchingId, setSwitchingId] = useState(null);
+  const mobile = useIsMobile();
+  const [tabKey, setTabKey] = useState("all");
+  const [q, setQ] = useState("");
+  const [channelFilter, setChannelFilter] = useState("all");
+  const [payFilter, setPayFilter] = useState("all");
+  const [dFrom, setDFrom] = useState("");
+  const [dTo, setDTo] = useState("");
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [bPage, setBPage] = useState(1);
+  const [bPageSize, setBPageSize] = useState(10);
+  const [confirm, setConfirm] = useState(null);
+  const [toast, setToast] = useState("");
+  const toastTimer = useRef(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [guestQuery, setGuestQuery] = useState("");
+  const [guestOpen, setGuestOpen] = useState(false);
   const [guestMode, setGuestMode] = useState(guests.length ? "existing" : "new");
   const [form, setForm] = useState({
     roomNumber: "",
@@ -2712,7 +2969,7 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
   const grossTotal = Number(form.totalAmount) || 0;
   const estimatedTotal = grossTotal * (1 - discountPercent / 100);
 
-  const submit = () => {
+  const submit = async () => {
     setFormError("");
     if (!form.checkOut) {
       setFormError("Fill in the check-out date.");
@@ -2741,7 +2998,8 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
       );
       return;
     }
-    onReserve({
+    setSubmitting(true);
+    const ok = await onReserve({
       roomNumber: form.roomNumber,
       guestId: guestMode === "existing" ? form.guestId : null,
       newGuest:
@@ -2757,7 +3015,8 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
       paymentMethod: form.paymentMethod,
       discountPercent,
       totalAmount: grossTotal,
-    });
+    }).finally(() => setSubmitting(false));
+    if (ok === false) return;
     setForm({
       roomNumber: "",
       guestId: "",
@@ -2776,6 +3035,8 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
     });
     setDuplicateGuestWarning("");
     setSelectingCheckout(false);
+    setGuestQuery("");
+    setShowNew(false);
   };
 
   const liveConflict =
@@ -2812,318 +3073,770 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
     }
   };
 
+  const todayStr = todayISO();
+  const tabCounts = useMemo(
+    () => ({
+      all: bookings.length,
+      inhouse: allBookings.filter((b) => b.status === "checked_in").length,
+      arrivals: allBookings.filter((b) => b.status === "reserved" && b.checkIn === todayStr).length,
+      departures: allBookings.filter((b) => b.status === "checked_in" && b.checkOut === todayStr).length,
+      cancelled: allBookings.filter((b) => b.status === "cancelled").length,
+    }),
+    [bookings, allBookings, todayStr]
+  );
+
+  const listRows = useMemo(() => {
+    let base;
+    if (tabKey === "cancelled") base = allBookings.filter((b) => b.status === "cancelled").sort((a, b) => b.checkIn.localeCompare(a.checkIn));
+    else if (tabKey === "inhouse") base = bookings.filter((b) => b.status === "checked_in");
+    else if (tabKey === "arrivals") base = bookings.filter((b) => b.status === "reserved" && b.checkIn === todayStr);
+    else if (tabKey === "departures") base = bookings.filter((b) => b.status === "checked_in" && b.checkOut === todayStr);
+    else base = bookings;
+    const needle = q.trim().toLowerCase().replace(/^#/, "");
+    return base.filter((b) => {
+      if (needle) {
+        const hit =
+          guestName(b.guestId).toLowerCase().includes(needle) ||
+          String(b.roomNumber || "").toLowerCase().includes(needle) ||
+          String(b.id).replace(/-/g, "").toLowerCase().includes(needle);
+        if (!hit) return false;
+      }
+      if (channelFilter !== "all" && (b.bookingType || "booking") !== channelFilter) return false;
+      if (payFilter === "none" && b.paymentMethod) return false;
+      if (payFilter !== "all" && payFilter !== "none" && b.paymentMethod !== payFilter) return false;
+      if ((dTo && b.checkIn > dTo) || (dFrom && b.checkOut < dFrom)) return false;
+      return true;
+    });
+  }, [tabKey, bookings, allBookings, q, channelFilter, payFilter, dFrom, dTo, todayStr, guests]);
+
+  useEffect(() => {
+    setBPage(1);
+  }, [tabKey, q, channelFilter, payFilter, dFrom, dTo, bPageSize]);
+
+  const bPageCount = Math.max(1, Math.ceil(listRows.length / bPageSize));
+  const bSafePage = Math.min(bPage, bPageCount);
+  const visibleRows = listRows.slice((bSafePage - 1) * bPageSize, bSafePage * bPageSize);
+  const filterCount = (channelFilter !== "all" ? 1 : 0) + (payFilter !== "all" ? 1 : 0) + (dFrom || dTo ? 1 : 0);
+  const hasAnyFilter = filterCount > 0 || q.trim() !== "";
+  const clearAllFilters = () => {
+    setQ("");
+    setChannelFilter("all");
+    setPayFilter("all");
+    setDFrom("");
+    setDTo("");
+  };
+  const toggleNew = () => {
+    setShowNew(!showNew);
+  };
+
+  const showToast = (msg) => {
+    setToast(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(""), 3800);
+  };
+  useEffect(() => () => clearTimeout(toastTimer.current), []);
+
+  // New-booking drawer: Esc closes it, page behind doesn't scroll.
+  useEffect(() => {
+    if (!showNew) return undefined;
+    const onKey = (e) => e.key === "Escape" && !submitting && setShowNew(false);
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [showNew, submitting]);
+
+  const stayNights = form.checkIn && form.checkOut ? nightsBetween(form.checkIn, form.checkOut) : 0;
+  const tileRooms = useMemo(() => {
+    const list = [...rangeAvailableRooms];
+    if (selectedRoom && !list.some((r) => r.number === selectedRoom.number)) list.unshift(selectedRoom);
+    return list;
+  }, [rangeAvailableRooms, selectedRoom]);
+  const guestMatches = useMemo(() => {
+    const needle = guestQuery.trim().toLowerCase();
+    const list = needle
+      ? guests.filter((g) => g.name.toLowerCase().includes(needle) || (g.phone || "").toLowerCase().includes(needle) || (g.nationalId || "").toLowerCase().includes(needle))
+      : guests;
+    return list.slice(0, 8);
+  }, [guests, guestQuery]);
+  const chosenGuest = guests.find((g) => g.id === form.guestId);
+  const chooseGuest = (g) => {
+    setForm((f) => ({ ...f, guestId: g.id }));
+    setGuestQuery("");
+    setGuestOpen(false);
+  };
+  const calcTotal =
+    selectedRoom && stayNights > 0
+      ? Math.round((form.persons || 1) * (getRoomRate(selectedRoom, roomRates) + mealPlanSurcharge(form.mealPlans, mealPlanRates)) * stayNights)
+      : 0;
+
+  const nbLabel = { fontSize: "0.72rem", color: TOKENS.inkSoft, marginBottom: 5, fontWeight: 600 };
+  const nbCard = { background: "#fff", border: `1px solid ${TOKENS.paperDim}`, borderRadius: 14, padding: "0.9rem", marginBottom: "1.1rem" };
+  const nbSectionHead = (n, title, sub) => (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "0 2px 8px" }}>
+      <span style={{ width: 26, height: 26, borderRadius: "50%", background: TOKENS.ink, color: TOKENS.paper, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: "0.78rem", fontWeight: 700, flexShrink: 0 }}>{n}</span>
+      <div>
+        <div style={{ fontWeight: 700, fontSize: "0.95rem" }}>{title}</div>
+        <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>{sub}</div>
+      </div>
+    </div>
+  );
+  const nbTile = (sel) => ({
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "flex-start",
+    gap: 2,
+    textAlign: "left",
+    padding: "0.55rem 0.65rem",
+    borderRadius: 12,
+    cursor: "pointer",
+    fontFamily: "inherit",
+    border: `1.5px solid ${sel ? TOKENS.ink : TOKENS.paperDim}`,
+    background: sel ? TOKENS.paperDim : "#fff",
+    minHeight: 64,
+  });
+
+  const renderActions = (b, stretch) => {
+    const grow = stretch ? { flex: 1, justifyContent: "center", padding: "0.55rem 0.4rem" } : {};
+    const base = { display: "inline-flex", alignItems: "center", gap: 5, whiteSpace: "nowrap", ...grow };
+    if (b.status === "reserved") {
+      const checkInBlock = checkInBlockReason(b);
+      return (
+        <>
+          <button className="gx-btn" onClick={() => setEditingId(b.id)} style={{ ...ghostBtn, ...base }}>
+            <Ico name="edit" size={13} /> Edit
+          </button>
+          <button
+            className="gx-btn"
+            aria-disabled={!!checkInBlock}
+            onClick={() => {
+              if (checkInBlock) return showToast(checkInBlock);
+              if (b.roomNumber) onCheckIn(b.id);
+              else setEditingId(b.id);
+            }}
+            style={{ ...primaryBtn, ...base, ...(checkInBlock ? { background: "#D9D4CB", color: "#8A8F98", cursor: "not-allowed" } : {}) }}
+            title={checkInBlock || (b.roomNumber ? "" : "Choose a room first")}
+          >
+            <Ico name="login" size={13} /> Check in
+          </button>
+          <button className="gx-btn" onClick={() => setConfirm({ kind: "cancel", booking: b })} style={{ ...ghostBtn, ...base, color: TOKENS.oos }}>
+            Cancel
+          </button>
+        </>
+      );
+    }
+    if (b.status === "checked_in") {
+      return (
+        <>
+          <button className="gx-btn" onClick={() => setEditingId(b.id)} style={{ ...ghostBtn, ...base }}>
+            <Ico name="edit" size={13} /> Edit
+          </button>
+          <button className="gx-btn" onClick={() => setSwitchingId(b.id)} style={{ ...ghostBtn, ...base }}>
+            <Ico name="swap" size={13} /> Switch
+          </button>
+          <button className="gx-btn" onClick={() => setConfirm({ kind: "checkout", booking: b })} style={{ ...primaryBtn, ...base }}>
+            <Ico name="logout" size={13} /> Check out
+          </button>
+        </>
+      );
+    }
+    return null;
+  };
+
+  const tabDefs = [
+    { key: "all", label: "All" },
+    { key: "inhouse", label: "In-House" },
+    { key: "arrivals", label: "Arrivals Today" },
+    { key: "departures", label: "Departures Today" },
+    { key: "cancelled", label: "Cancelled" },
+  ];
+
+  const filterControls = (
+    <>
+      <select value={channelFilter} onChange={(e) => setChannelFilter(e.target.value)} style={{ ...inputStyle, minWidth: 0 }} aria-label="Channel filter">
+        <option value="all">All channels</option>
+        {BOOKING_TYPES.map((t) => (
+          <option key={t.key} value={t.key}>
+            {t.label}
+          </option>
+        ))}
+      </select>
+      <select value={payFilter} onChange={(e) => setPayFilter(e.target.value)} style={{ ...inputStyle, minWidth: 0 }} aria-label="Payment method filter">
+        <option value="all">All payment methods</option>
+        {PAYMENT_METHODS.map((m) => (
+          <option key={m.key} value={m.key}>
+            {m.label}
+          </option>
+        ))}
+        <option value="none">Not set</option>
+      </select>
+      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.72rem", color: TOKENS.inkSoft }}>
+        From
+        <input type="date" value={dFrom} onChange={(e) => setDFrom(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 0 }} />
+      </label>
+      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.72rem", color: TOKENS.inkSoft }}>
+        to
+        <input type="date" value={dTo} onChange={(e) => setDTo(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 0 }} />
+      </label>
+    </>
+  );
+
+  const th = { textAlign: "left", fontSize: "0.7rem", fontWeight: 600, color: TOKENS.inkSoft, padding: "0.65rem 0.9rem", background: "#FBF8F3", whiteSpace: "nowrap" };
+  const td = { padding: "0.7rem 0.9rem", fontSize: "0.84rem", verticalAlign: "middle", borderTop: `1px solid ${TOKENS.paperDim}` };
+
   return (
-    <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
-        <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", margin: 0 }}>Bookings</h2>
-        <button onClick={() => setShowNew(!showNew)} style={primaryBtn}>
-          {showNew ? "Cancel" : "New booking"}
-        </button>
+    <div style={mobile ? { paddingBottom: 84 } : undefined}>
+      <style>{GUESTS_CSS}</style>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "0.9rem", gap: 10, flexWrap: "wrap" }}>
+        <div>
+          <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", margin: 0 }}>Bookings</h2>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 }}>
+            <SoftBadge color={TOKENS.clean} bg={TOKENS.cleanBg}>
+              In-House: {tabCounts.inhouse}
+            </SoftBadge>
+            <SoftBadge color={TOKENS.reserved} bg={TOKENS.reservedBg}>
+              Arriving today: {tabCounts.arrivals}
+            </SoftBadge>
+            <SoftBadge color={TOKENS.dirty} bg={TOKENS.dirtyBg}>
+              Checking out today: {tabCounts.departures}
+            </SoftBadge>
+          </div>
+        </div>
+        {!mobile && (
+          <button onClick={toggleNew} style={{ ...primaryBtn, display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <Ico name={showNew ? "x" : "plus"} size={14} /> {showNew ? "Cancel" : "New booking"}
+          </button>
+        )}
       </div>
 
-      {showNew && (
-        <div style={cardStyle}>
-          <div style={{ marginBottom: "0.75rem" }}>
-            <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Booking type</div>
-            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <span
-                style={{
-                  width: 14,
-                  height: 14,
-                  borderRadius: "50%",
-                  background: bookingTypeMeta(form.bookingType).color,
-                  flexShrink: 0,
-                }}
-              />
-              <select
-                value={form.bookingType}
-                onChange={(e) => setForm({ ...form, bookingType: e.target.value })}
-                style={{ ...inputStyle, width: "100%" }}
-              >
-                {BOOKING_TYPES.map((t) => (
-                  <option key={t.key} value={t.key}>
-                    {t.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
+      {mobile && (
+        <button
+          onClick={toggleNew}
+          aria-label={showNew ? "Cancel new booking" : "New booking"}
+          style={{
+            position: "fixed",
+            right: 18,
+            bottom: 22,
+            width: 56,
+            height: 56,
+            borderRadius: "50%",
+            border: "none",
+            background: showNew ? TOKENS.inkSoft : TOKENS.ink,
+            color: TOKENS.paper,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            boxShadow: "0 6px 18px rgba(27,36,48,0.35)",
+            cursor: "pointer",
+            zIndex: 50,
+          }}
+        >
+          <Ico name={showNew ? "x" : "plus"} size={24} />
+        </button>
+      )}
 
-          <div style={{ marginBottom: "0.75rem" }}>
-            <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>
-              {selectingCheckout ? "Now click the check-out day" : "Click a day for check-in"}
+      {showNew && (
+        <div
+          style={{ position: "fixed", inset: 0, zIndex: 65, background: "rgba(27,36,48,0.45)", display: "flex", justifyContent: "flex-end", animation: "gxFade .15s ease-out" }}
+          role="presentation"
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="New booking"
+            style={{ width: mobile ? "100%" : 580, maxWidth: "100vw", height: "100%", background: TOKENS.paper, display: "flex", flexDirection: "column", animation: "nbSlide .24s ease-out", boxShadow: "-12px 0 40px rgba(0,0,0,0.18)" }}
+          >
+            {/* Header */}
+            <div style={{ padding: "1rem 1.1rem", background: "#fff", borderBottom: `1px solid ${TOKENS.paperDim}`, display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontFamily: "Fraunces, serif", fontSize: "1.2rem", fontWeight: 600 }}>New booking</div>
+                <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>Dates &amp; room · Guest · Pricing &amp; payment</div>
+              </div>
+              <button className="gx-btn" onClick={() => !submitting && setShowNew(false)} aria-label="Close" style={{ ...ghostBtn, padding: "0.5rem", display: "inline-flex", minWidth: 40, minHeight: 40, alignItems: "center", justifyContent: "center" }}>
+                <Ico name="x" size={17} />
+              </button>
             </div>
-            <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", alignItems: "flex-start" }}>
-              <MonthCalendar
-                year={calYear}
-                month={calMonth}
-                onMonthChange={(y, m) => {
-                  setCalYear(y);
-                  setCalMonth(m);
-                }}
-                highlightedDates={fullyBookedDates}
-                todayIso={todayISO()}
-                onDayClick={pickDay}
-                rangeStart={form.checkIn}
-                rangeEnd={form.checkOut}
-                legendLabel="Fully booked"
-              />
-              <div style={{ ...cardStyle, flex: "1 1 200px", minWidth: 200, margin: 0 }}>
-                <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft, marginBottom: 6 }}>
-                  {form.checkIn && form.checkOut
-                    ? `Available rooms, ${fmtDate(form.checkIn)} → ${fmtDate(form.checkOut)}`
-                    : "Pick check-in and check-out to see available rooms"}
+
+            {/* Body */}
+            <div style={{ flex: 1, overflowY: "auto", padding: "1rem 1.1rem 1.5rem", WebkitOverflowScrolling: "touch" }}>
+              {/* 1. Dates & room */}
+              {nbSectionHead(1, "Dates & room", "Pick the stay, the channel and (optionally) the room")}
+              <div style={nbCard}>
+                <div style={nbLabel}>Booking channel</div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 14 }}>
+                  <span style={{ width: 14, height: 14, borderRadius: "50%", background: bookingTypeMeta(form.bookingType).color, flexShrink: 0 }} />
+                  <select value={form.bookingType} onChange={(e) => setForm({ ...form, bookingType: e.target.value })} style={{ ...inputStyle, width: "100%", minHeight: 44, fontSize: "1rem" }}>
+                    {BOOKING_TYPES.map((t) => (
+                      <option key={t.key} value={t.key}>
+                        {t.label}
+                      </option>
+                    ))}
+                  </select>
                 </div>
-                {form.checkIn && form.checkOut && rangeAvailableRooms.length === 0 && (
-                  <div style={{ color: TOKENS.inkSoft, fontSize: "0.8rem" }}>No rooms free for these dates.</div>
+
+                <div style={nbLabel}>{selectingCheckout ? "Now tap the check-out day" : "Tap a day for check-in, then one for check-out"}</div>
+                <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}>
+                  <MonthCalendar
+                    year={calYear}
+                    month={calMonth}
+                    onMonthChange={(y, m) => {
+                      setCalYear(y);
+                      setCalMonth(m);
+                    }}
+                    highlightedDates={fullyBookedDates}
+                    todayIso={todayISO()}
+                    onDayClick={pickDay}
+                    rangeStart={form.checkIn}
+                    rangeEnd={form.checkOut}
+                    legendLabel="Fully booked"
+                  />
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+                  <label>
+                    <div style={nbLabel}>Check-in</div>
+                    <input type="date" value={form.checkIn} onChange={(e) => setForm({ ...form, checkIn: e.target.value })} style={{ ...inputStyle, width: "100%", boxSizing: "border-box", minHeight: 44 }} />
+                  </label>
+                  <label>
+                    <div style={nbLabel}>Check-out</div>
+                    <input type="date" value={form.checkOut} onChange={(e) => setForm({ ...form, checkOut: e.target.value })} style={{ ...inputStyle, width: "100%", boxSizing: "border-box", minHeight: 44 }} />
+                  </label>
+                </div>
+                {stayNights > 0 && (
+                  <div style={{ display: "inline-flex", alignItems: "center", gap: 6, background: TOKENS.cleanBg, color: TOKENS.clean, borderRadius: 999, padding: "4px 12px", fontSize: "0.78rem", fontWeight: 600, marginBottom: 14 }}>
+                    <Ico name="calendar" size={13} /> {fmtDate(form.checkIn)} → {fmtDate(form.checkOut)} · {stayNights} night{stayNights === 1 ? "" : "s"}
+                  </div>
                 )}
-                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                  {rangeAvailableRooms.map((r) => (
-                    <button
-                      key={r.number}
-                      type="button"
-                      onClick={() => pickRoom(r.number)}
-                      style={{
-                        ...ghostBtn,
-                        textAlign: "left",
-                        padding: "0.4rem 0.6rem",
-                        background: form.roomNumber === r.number ? TOKENS.paperDim : "#fff",
-                      }}
-                    >
-                      {r.number} · {r.type}
+
+                <div style={{ ...nbLabel, display: "flex", justifyContent: "space-between" }}>
+                  <span>Room</span>
+                  {stayNights > 0 && (
+                    <span style={{ fontWeight: 400 }}>
+                      {rangeAvailableRooms.length} available
+                    </span>
+                  )}
+                </div>
+                {stayNights <= 0 ? (
+                  <div style={{ fontSize: "0.8rem", color: TOKENS.inkSoft, background: TOKENS.paper, borderRadius: 10, padding: "0.7rem 0.8rem" }}>
+                    Pick check-in and check-out dates to see which rooms are free. You can also leave the room empty and choose it later.
+                  </div>
+                ) : (
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(112px, 1fr))", gap: 8, maxHeight: 230, overflowY: "auto", padding: 2 }}>
+                    <button type="button" className="gx-btn" onClick={() => pickRoom("")} style={nbTile(form.roomNumber === "")}>
+                      <span style={{ fontWeight: 700, fontSize: "0.85rem" }}>No room yet</span>
+                      <span style={{ fontSize: "0.68rem", color: TOKENS.inkSoft }}>choose later</span>
+                    </button>
+                    {tileRooms.map((r) => {
+                      const sel = form.roomNumber === r.number;
+                      const dot = r.status === "vacant_clean" ? { c: TOKENS.clean, t: "Clean" } : r.status === "vacant_dirty" ? { c: TOKENS.dirty, t: "Needs cleaning" } : { c: "#3B6FA0", t: "Frees up" };
+                      return (
+                        <button key={r.number} type="button" className="gx-btn" onClick={() => pickRoom(r.number)} style={nbTile(sel)} aria-pressed={sel}>
+                          <span style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%" }}>
+                            <span style={{ fontFamily: "Fraunces, serif", fontWeight: 700, fontSize: "1.15rem" }}>{r.number}</span>
+                            {sel && <Ico name="check" size={15} color={TOKENS.clean} />}
+                          </span>
+                          <span style={{ fontSize: "0.68rem", color: TOKENS.inkSoft }}>{r.type}</span>
+                          <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: "0.66rem", color: dot.c, fontWeight: 600 }}>
+                            <span style={{ width: 7, height: 7, borderRadius: "50%", background: dot.c }} /> {dot.t}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+                {stayNights > 0 && rangeAvailableRooms.length === 0 && <div style={{ color: TOKENS.oos, fontSize: "0.8rem", marginTop: 8 }}>No rooms are free for these dates.</div>}
+
+                {selectedRoom && (
+                  <>
+                    <div style={{ ...nbLabel, marginTop: 14 }}>How many people ({selectedRoom.type})</div>
+                    <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                      {occupancyOptions.map((n) => (
+                        <button key={n} type="button" className="gx-btn" onClick={() => setForm({ ...form, persons: n })} style={{ ...ghostBtn, flex: 1, minHeight: 42, background: form.persons === n ? TOKENS.ink : "#fff", color: form.persons === n ? TOKENS.paper : TOKENS.ink, borderColor: form.persons === n ? TOKENS.ink : TOKENS.paperDim, fontWeight: 600 }}>
+                          {n} {n === 1 ? "person" : "persons"}
+                        </button>
+                      ))}
+                    </div>
+                    <div style={nbLabel}>Meal plan</div>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      {[null, ...GUEST_MEAL_PLAN_CHOICES].map((plan) => {
+                        const sel = plan === null ? form.mealPlans.length === 0 : form.mealPlans[0] === plan;
+                        return (
+                          <button key={plan || "none"} type="button" className="gx-btn" onClick={() => selectMealPlan(plan)} style={{ ...ghostBtn, minHeight: 40, background: sel ? "#DCE9F5" : "#fff", color: sel ? "#2F5F8F" : TOKENS.inkSoft, borderColor: sel ? "#2F5F8F" : TOKENS.paperDim, fontWeight: sel ? 700 : 400 }}>
+                            {plan || "None"}
+                            {plan && !FREE_MEAL_PLANS.includes(plan) && <span style={{ fontSize: "0.66rem", marginLeft: 4, opacity: 0.8 }}>+{fmtMoney((mealPlanRates && mealPlanRates[plan]) || 0)}</span>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {/* 2. Guest */}
+              {nbSectionHead(2, "Guest information", "Search an existing guest or add a new one")}
+              <div style={nbCard}>
+                <div style={{ display: "flex", background: TOKENS.paper, borderRadius: 12, padding: 4, marginBottom: 12 }} role="tablist">
+                  {[
+                    { key: "existing", label: "Existing guest", icon: "users" },
+                    { key: "new", label: "New guest", icon: "plus" },
+                  ].map((t) => {
+                    const act = guestMode === t.key;
+                    return (
+                      <button key={t.key} type="button" role="tab" aria-selected={act} className="gx-btn" onClick={() => setGuestMode(t.key)} style={{ flex: 1, minHeight: 42, border: "none", borderRadius: 9, cursor: "pointer", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6, background: act ? "#fff" : "transparent", color: act ? TOKENS.ink : TOKENS.inkSoft, fontWeight: act ? 700 : 500, boxShadow: act ? "0 1px 4px rgba(27,36,48,0.12)" : "none", fontFamily: "inherit", fontSize: "0.88rem" }}>
+                        <Ico name={t.icon} size={14} /> {t.label}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {guestMode === "existing" ? (
+                  chosenGuest ? (
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, border: `1px solid ${TOKENS.clean}`, background: TOKENS.cleanBg, borderRadius: 12, padding: "0.65rem 0.8rem" }}>
+                      <span style={{ width: 36, height: 36, borderRadius: "50%", background: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                        <Ico name="user" size={17} color={TOKENS.clean} />
+                      </span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{chosenGuest.name}</div>
+                        <div style={{ fontSize: "0.74rem", color: TOKENS.inkSoft }}>{chosenGuest.phone || chosenGuest.nationalId || "No contact info"}</div>
+                      </div>
+                      <button type="button" className="gx-btn" onClick={() => { setForm({ ...form, guestId: "" }); setGuestQuery(""); setGuestOpen(true); }} style={{ ...ghostBtn, background: "#fff" }}>
+                        Change
+                      </button>
+                    </div>
+                  ) : (
+                    <div style={{ position: "relative" }}>
+                      <Ico name="search" size={15} color={TOKENS.inkSoft} style={{ position: "absolute", left: 11, top: 15, pointerEvents: "none" }} />
+                      <input
+                        placeholder="Search by name, phone or ID…"
+                        value={guestQuery}
+                        onChange={(e) => { setGuestQuery(e.target.value); setGuestOpen(true); }}
+                        onFocus={() => setGuestOpen(true)}
+                        onBlur={() => setTimeout(() => setGuestOpen(false), 150)}
+                        onKeyDown={(e) => { if (e.key === "Enter" && guestMatches[0]) { e.preventDefault(); chooseGuest(guestMatches[0]); } }}
+                        style={{ ...inputStyle, width: "100%", boxSizing: "border-box", minHeight: 46, paddingLeft: 34, fontSize: "1rem" }}
+                      />
+                      {guestOpen && (
+                        <div style={{ position: "absolute", left: 0, right: 0, top: 50, zIndex: 5, background: "#fff", border: `1px solid ${TOKENS.paperDim}`, borderRadius: 12, boxShadow: "0 10px 28px rgba(27,36,48,0.16)", maxHeight: 250, overflowY: "auto" }}>
+                          {guestMatches.length === 0 ? (
+                            <div style={{ padding: "0.8rem", fontSize: "0.82rem", color: TOKENS.inkSoft }}>
+                              No guest found.{" "}
+                              <button type="button" className="gx-btn" onMouseDown={(e) => e.preventDefault()} onClick={() => { setGuestMode("new"); setForm({ ...form, name: guestQuery }); }} style={{ ...ghostBtn, marginLeft: 4 }}>
+                                Add as new guest
+                              </button>
+                            </div>
+                          ) : (
+                            guestMatches.map((g) => (
+                              <button key={g.id} type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => chooseGuest(g)} style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", textAlign: "left", border: "none", borderBottom: `1px solid ${TOKENS.paperDim}`, background: "#fff", padding: "0.65rem 0.8rem", cursor: "pointer", fontFamily: "inherit" }}>
+                                <Ico name="user" size={15} color={TOKENS.inkSoft} />
+                                <span style={{ minWidth: 0 }}>
+                                  <span style={{ display: "block", fontWeight: 600, fontSize: "0.88rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{g.name}</span>
+                                  <span style={{ display: "block", fontSize: "0.72rem", color: TOKENS.inkSoft }}>{[g.phone, g.nationalId].filter(Boolean).join(" · ") || "No contact info"}</span>
+                                </span>
+                              </button>
+                            ))
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )
+                ) : (
+                  <div style={{ display: "grid", gridTemplateColumns: mobile ? "1fr" : "1fr 1fr", gap: 10 }}>
+                    <input placeholder="Full name *" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} style={{ ...inputStyle, minHeight: 44, gridColumn: "1 / -1", fontSize: "1rem" }} />
+                    <input placeholder="National ID / passport (optional)" value={form.nationalId} onChange={(e) => setForm({ ...form, nationalId: e.target.value })} onBlur={(e) => checkDuplicateNationalId(e.target.value)} style={{ ...inputStyle, minHeight: 44, fontSize: "1rem" }} />
+                    <input placeholder="Phone (optional)" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} style={{ ...inputStyle, minHeight: 44, fontSize: "1rem" }} />
+                    <input placeholder="Email (optional)" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} style={{ ...inputStyle, minHeight: 44, gridColumn: "1 / -1", fontSize: "1rem" }} />
+                    {duplicateGuestWarning && (
+                      <div style={{ gridColumn: "1 / -1", fontSize: "0.78rem", color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.7rem" }}>⚠ {duplicateGuestWarning}</div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* 3. Pricing & payment */}
+              {nbSectionHead(3, "Pricing & payment", "Total, discount and how the guest pays")}
+              <div style={nbCard}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 8 }}>
+                  <label>
+                    <div style={nbLabel}>Total (EGP)</div>
+                    <input type="number" min="0" step="1" inputMode="decimal" placeholder="Enter total" value={form.totalAmount} onChange={(e) => setForm({ ...form, totalAmount: e.target.value })} style={{ ...inputStyle, width: "100%", boxSizing: "border-box", minHeight: 44, fontSize: "1rem" }} />
+                  </label>
+                  <label>
+                    <div style={nbLabel}>Discount (%)</div>
+                    <input type="number" min="0" max="100" step="1" inputMode="decimal" value={form.discountPercent} onChange={(e) => setForm({ ...form, discountPercent: e.target.value })} style={{ ...inputStyle, width: "100%", boxSizing: "border-box", minHeight: 44, fontSize: "1rem" }} />
+                  </label>
+                </div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12, alignItems: "center" }}>
+                  {[0, 5, 10, 15, 20].map((d) => (
+                    <button key={d} type="button" className="gx-btn" onClick={() => setForm({ ...form, discountPercent: d })} style={{ ...ghostBtn, padding: "0.3rem 0.7rem", background: discountPercent === d ? TOKENS.ink : "#fff", color: discountPercent === d ? TOKENS.paper : TOKENS.inkSoft, borderColor: discountPercent === d ? TOKENS.ink : TOKENS.paperDim }}>
+                      {d}%
                     </button>
                   ))}
+                  {calcTotal > 0 && Number(form.totalAmount) !== calcTotal && (
+                    <button type="button" className="gx-btn" onClick={() => setForm({ ...form, totalAmount: String(calcTotal) })} style={{ ...ghostBtn, marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: 5, color: "#2F5F8F", borderColor: "#9DB9D6", background: "#EEF4FA" }}>
+                      <Ico name="sparkles" size={13} /> Use calculated {fmtMoney(calcTotal)}
+                    </button>
+                  )}
+                </div>
+
+                <div style={nbLabel}>Payment method</div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }} role="radiogroup" aria-label="Payment method">
+                  {PAYMENT_METHODS.map((m) => {
+                    const sel = form.paymentMethod === m.key;
+                    return (
+                      <button key={m.key} type="button" role="radio" aria-checked={sel} className="gx-btn" onClick={() => setForm({ ...form, paymentMethod: sel ? "" : m.key })} style={{ display: "inline-flex", alignItems: "center", gap: 8, minHeight: 44, padding: "0.4rem 0.9rem", borderRadius: 999, cursor: "pointer", fontFamily: "inherit", fontSize: "0.88rem", border: `1.5px solid ${sel ? TOKENS.ink : TOKENS.paperDim}`, background: sel ? TOKENS.ink : "#fff", color: sel ? TOKENS.paper : TOKENS.ink, fontWeight: sel ? 700 : 500 }}>
+                        <span style={{ width: 16, height: 16, borderRadius: "50%", border: `2px solid ${sel ? TOKENS.paper : TOKENS.inkSoft}`, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
+                          {sel && <span style={{ width: 7, height: 7, borderRadius: "50%", background: TOKENS.paper }} />}
+                        </span>
+                        {m.label}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
             </div>
-          </div>
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.75rem", marginBottom: "0.75rem" }}>
-            <div>
-              <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Check-in</div>
-              <input type="date" value={form.checkIn} onChange={(e) => setForm({ ...form, checkIn: e.target.value })} style={{ ...inputStyle, width: "100%" }} />
-            </div>
-            <div>
-              <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Check-out</div>
-              <input type="date" value={form.checkOut} onChange={(e) => setForm({ ...form, checkOut: e.target.value })} style={{ ...inputStyle, width: "100%" }} />
-            </div>
-            <select value={form.roomNumber} onChange={(e) => pickRoom(e.target.value)} style={{ ...inputStyle, gridColumn: "1 / -1" }}>
-              <option value="">Room (optional — choose later)…</option>
-              {roomOptions.map(({ room: r, checkingOut }) => (
-                <option key={r.number} value={r.number}>
-                  {r.number} · {r.type}
-                  {checkingOut ? " (check out)" : ""}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div style={{ display: "flex", gap: 8, marginBottom: "0.75rem" }}>
-            <button
-              onClick={() => setGuestMode("existing")}
-              style={{ ...ghostBtn, flex: 1, background: guestMode === "existing" ? TOKENS.paperDim : "#fff" }}
-            >
-              Existing guest
-            </button>
-            <button
-              onClick={() => setGuestMode("new")}
-              style={{ ...ghostBtn, flex: 1, background: guestMode === "new" ? TOKENS.paperDim : "#fff" }}
-            >
-              New guest
-            </button>
-          </div>
-
-          {guestMode === "existing" ? (
-            <select value={form.guestId} onChange={(e) => setForm({ ...form, guestId: e.target.value })} style={{ ...inputStyle, width: "100%", marginBottom: "0.75rem" }}>
-              <option value="">Select guest…</option>
-              {guests.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: "0.75rem" }}>
-              <input placeholder="Full name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} style={inputStyle} />
-              <input
-                placeholder="National ID / passport number (optional)"
-                value={form.nationalId}
-                onChange={(e) => setForm({ ...form, nationalId: e.target.value })}
-                onBlur={(e) => checkDuplicateNationalId(e.target.value)}
-                style={inputStyle}
-              />
-              {duplicateGuestWarning && (
-                <div style={{ fontSize: "0.78rem", color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.7rem" }}>
-                  ⚠ {duplicateGuestWarning}
+            {/* Sticky footer */}
+            <div style={{ padding: "0.8rem 1.1rem calc(0.8rem + env(safe-area-inset-bottom, 0px))", background: "#fff", borderTop: `1px solid ${TOKENS.paperDim}`, boxShadow: "0 -6px 20px rgba(27,36,48,0.06)" }}>
+              {!formError && liveConflict && (
+                <div style={{ fontSize: "0.8rem", color: TOKENS.dirty, background: TOKENS.dirtyBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginBottom: 8, display: "flex", gap: 6, alignItems: "flex-start" }}>
+                  <Ico name="alert" size={14} style={{ marginTop: 2 }} /> Room {form.roomNumber} is already booked for {guestName(liveConflict.guestId)} in that window.
                 </div>
               )}
-              <input placeholder="Phone (optional)" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} style={inputStyle} />
-              <input placeholder="Email (optional)" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} style={inputStyle} />
-            </div>
-          )}
-
-          {selectedRoom && (
-            <div style={{ marginBottom: "0.75rem" }}>
-              <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>
-                How many people ({selectedRoom.type})?
-              </div>
-              <div style={{ display: "flex", gap: 6 }}>
-                {occupancyOptions.map((n) => (
-                  <button
-                    key={n}
-                    onClick={() => setForm({ ...form, persons: n })}
-                    style={{ ...ghostBtn, flex: 1, background: form.persons === n ? TOKENS.paperDim : "#fff" }}
-                  >
-                    {n} {n === 1 ? "person" : "persons"}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {showMealPlans && (
-            <div style={{ marginBottom: "0.75rem" }}>
-              <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Meal plan</div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.82rem" }}>
-                  <input type="radio" name="bookingsTabMealPlan" checked={form.mealPlans.length === 0} onChange={() => selectMealPlan(null)} />
-                  None
-                </label>
-                {GUEST_MEAL_PLAN_CHOICES.map((plan) => (
-                  <label key={plan} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.82rem" }}>
-                    <input type="radio" name="bookingsTabMealPlan" checked={form.mealPlans[0] === plan} onChange={() => selectMealPlan(plan)} />
-                    {plan}{" "}
-                    <span style={{ color: TOKENS.inkSoft, fontSize: "0.75rem" }}>
-                      {FREE_MEAL_PLANS.includes(plan) ? "(no charge)" : `(+${fmtMoney((mealPlanRates && mealPlanRates[plan]) || 0)}/person/night)`}
-                    </span>
-                  </label>
-                ))}
-              </div>
-            </div>
-          )}
-
-          <PaymentMethodPicker value={form.paymentMethod} onChange={(v) => setForm({ ...form, paymentMethod: v })} />
-
-          <div style={{ marginBottom: "0.75rem" }}>
-            <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Estimated total (EGP)</div>
-            <input
-              type="number"
-              min="0"
-              step="1"
-              placeholder="Enter total manually"
-              value={form.totalAmount}
-              onChange={(e) => setForm({ ...form, totalAmount: e.target.value })}
-              style={{ ...inputStyle, width: "100%" }}
-            />
-          </div>
-
-          <div style={{ marginBottom: "0.75rem" }}>
-            <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Discount (%)</div>
-            <input
-              type="number"
-              min="0"
-              max="100"
-              step="1"
-              value={form.discountPercent}
-              onChange={(e) => setForm({ ...form, discountPercent: e.target.value })}
-              style={{ ...inputStyle, width: "100%" }}
-            />
-          </div>
-
-          {grossTotal > 0 && (
-            <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, marginBottom: "0.75rem" }}>
-              Total to charge: <strong style={{ color: TOKENS.ink }}>{fmtMoney(estimatedTotal)}</strong>
-              {discountPercent > 0 && (
-                <>
-                  {" "}
-                  <span style={{ textDecoration: "line-through", color: TOKENS.inkSoft }}>{fmtMoney(grossTotal)}</span>{" "}
-                  <span style={{ color: TOKENS.clean }}>(−{discountPercent}%)</span>
-                </>
+              {formError && (
+                <div style={{ fontSize: "0.8rem", color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginBottom: 8, display: "flex", gap: 6, alignItems: "flex-start" }}>
+                  <Ico name="alert" size={14} style={{ marginTop: 2 }} /> {formError}
+                </div>
               )}
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, gap: 8 }}>
+                <div style={{ fontSize: "0.74rem", color: TOKENS.inkSoft }}>
+                  {selectedRoom ? roomLabel(selectedRoom.number) : "No room yet"}
+                  {stayNights > 0 ? ` · ${stayNights} night${stayNights === 1 ? "" : "s"}` : ""}
+                  {form.paymentMethod ? ` · ${paymentMethodLabel(form.paymentMethod)}` : ""}
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: "0.66rem", color: TOKENS.inkSoft }}>Total to charge</div>
+                  <div style={{ fontFamily: "Fraunces, serif", fontSize: "1.35rem", fontWeight: 700, lineHeight: 1.1 }}>
+                    {grossTotal > 0 ? fmtMoney(estimatedTotal) : "—"}
+                    {grossTotal > 0 && discountPercent > 0 && (
+                      <span style={{ fontFamily: "Inter, sans-serif", fontSize: "0.72rem", fontWeight: 500, marginLeft: 6 }}>
+                        <span style={{ textDecoration: "line-through", color: TOKENS.inkSoft }}>{fmtMoney(grossTotal)}</span> <span style={{ color: TOKENS.clean }}>−{discountPercent}%</span>
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="gx-btn" onClick={() => !submitting && setShowNew(false)} disabled={submitting} style={{ ...ghostBtn, minHeight: 48, padding: "0.5rem 1.1rem", fontSize: "0.92rem" }}>
+                  Cancel
+                </button>
+                <button className="gx-btn" onClick={submit} disabled={!!liveConflict || submitting} style={{ ...primaryBtn, flex: 1, minHeight: 48, fontSize: "0.95rem", fontWeight: 700, display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: liveConflict || submitting ? 0.6 : 1, cursor: liveConflict || submitting ? "not-allowed" : "pointer" }}>
+                  {submitting ? (
+                    <>
+                      <span style={{ width: 16, height: 16, border: "2px solid rgba(255,255,255,0.4)", borderTopColor: "#fff", borderRadius: "50%", animation: "nbSpin .7s linear infinite" }} />
+                      Creating…
+                    </>
+                  ) : (
+                    <>
+                      <Ico name="check" size={17} /> Confirm &amp; Create Booking
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
-          )}
-
-          {!formError && liveConflict && (
-            <div style={{ fontSize: "0.8rem", color: TOKENS.dirty, background: TOKENS.dirtyBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginBottom: 8 }}>
-              Heads up: room {form.roomNumber} is already booked for {guestName(liveConflict.guestId)} in that window.
-            </div>
-          )}
-          {formError && (
-            <div style={{ fontSize: "0.8rem", color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginBottom: 8 }}>
-              {formError}
-            </div>
-          )}
-          <button onClick={submit} style={primaryBtn} disabled={!!liveConflict}>
-            Create booking
-          </button>
+          </div>
         </div>
       )}
 
-      {bookings.length === 0 && !showNew && (
-        <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem" }}>No upcoming or active bookings.</div>
+      {/* Status tabs */}
+      <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 6, marginBottom: 8, WebkitOverflowScrolling: "touch" }} role="tablist">
+        {tabDefs.map((t) => {
+          const active = tabKey === t.key;
+          return (
+            <button
+              key={t.key}
+              role="tab"
+              aria-selected={active}
+              className="gx-btn"
+              onClick={() => setTabKey(t.key)}
+              style={{
+                ...ghostBtn,
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                whiteSpace: "nowrap",
+                background: active ? TOKENS.ink : "#fff",
+                color: active ? TOKENS.paper : TOKENS.inkSoft,
+                borderColor: active ? TOKENS.ink : TOKENS.paperDim,
+                fontWeight: active ? 600 : 400,
+                flexShrink: 0,
+              }}
+            >
+              {t.label}
+              <span style={{ fontSize: "0.68rem", borderRadius: 999, padding: "1px 7px", background: active ? "rgba(255,255,255,0.18)" : TOKENS.paper, color: active ? TOKENS.paper : TOKENS.inkSoft }}>
+                {tabCounts[t.key]}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Search + filters */}
+      <div style={{ ...cardStyle, padding: "0.65rem", marginBottom: 12 }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: mobile ? "nowrap" : "wrap" }}>
+          <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
+            <Ico name="search" size={15} color={TOKENS.inkSoft} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", pointerEvents: "none" }} />
+            <input
+              placeholder="Search guest, room or reservation ID…"
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              style={{ ...inputStyle, width: "100%", boxSizing: "border-box", paddingLeft: 32, paddingRight: q ? 30 : undefined }}
+            />
+            {q && (
+              <button className="gx-btn" onClick={() => setQ("")} aria-label="Clear search" style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", border: "none", background: "none", cursor: "pointer", display: "inline-flex", color: TOKENS.inkSoft }}>
+                <Ico name="x" size={14} />
+              </button>
+            )}
+          </div>
+          {mobile ? (
+            <button className="gx-btn" onClick={() => setFiltersOpen(!filtersOpen)} style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 6, background: filtersOpen ? TOKENS.paperDim : "#fff" }}>
+              <Ico name="filter" size={14} /> Filters
+              {filterCount > 0 && <span style={{ background: TOKENS.ink, color: TOKENS.paper, borderRadius: 999, fontSize: "0.65rem", padding: "1px 6px" }}>{filterCount}</span>}
+            </button>
+          ) : (
+            <>
+              {filterControls}
+              {hasAnyFilter && (
+                <button className="gx-btn" onClick={clearAllFilters} style={ghostBtn}>
+                  Clear
+                </button>
+              )}
+            </>
+          )}
+        </div>
+        {mobile && filtersOpen && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 10 }}>
+            {filterControls}
+            {hasAnyFilter && (
+              <button className="gx-btn" onClick={clearAllFilters} style={ghostBtn}>
+                Clear all
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {loading ? (
+        <BookingsSkeleton mobile={mobile} />
+      ) : listRows.length === 0 ? (
+        <div style={{ ...cardStyle, textAlign: "center", padding: "2.5rem 1rem", color: TOKENS.inkSoft }}>
+          <div style={{ display: "inline-flex", padding: 14, borderRadius: "50%", background: TOKENS.paper, marginBottom: 10 }}>
+            <Ico name="inbox" size={26} color={TOKENS.brass} />
+          </div>
+          <div style={{ fontWeight: 600, color: TOKENS.ink, marginBottom: 4 }}>
+            {hasAnyFilter ? "No bookings match your filters" : tabKey === "cancelled" ? "No cancelled bookings" : "No bookings here yet"}
+          </div>
+          <div style={{ fontSize: "0.82rem", marginBottom: 12 }}>
+            {hasAnyFilter ? "Try a different search, or clear the filters." : "New reservations will show up in this list."}
+          </div>
+          {hasAnyFilter ? (
+            <button onClick={clearAllFilters} style={ghostBtn}>
+              Clear search & filters
+            </button>
+          ) : (
+            tabKey !== "cancelled" && (
+              <button onClick={() => !showNew && toggleNew()} style={primaryBtn}>
+                New booking
+              </button>
+            )
+          )}
+        </div>
+      ) : mobile ? (
+        <div>
+          {visibleRows.map((b) => {
+            const meta = BOOKING_STATUS_META[b.status] || BOOKING_STATUS_META.reserved;
+            const n = nightsBetween(b.checkIn, b.checkOut);
+            return (
+              <div key={b.id} style={{ ...cardStyle, opacity: b.status === "cancelled" ? 0.85 : 1 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontWeight: 700, fontSize: "1.02rem" }}>{roomLabel(b.roomNumber)}</div>
+                    <div style={{ fontWeight: 600, fontSize: "0.92rem", wordBreak: "break-word" }}>{guestName(b.guestId)}</div>
+                  </div>
+                  <SoftBadge color={meta.color} bg={meta.bg}>
+                    {meta.label}
+                  </SoftBadge>
+                </div>
+                <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, margin: "6px 0", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                  <Ico name="calendar" size={12} />
+                  {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)}
+                  {n > 0 && (
+                    <span>
+                      · {n} night{n === 1 ? "" : "s"}
+                    </span>
+                  )}
+                  <span style={{ marginLeft: "auto", fontSize: "0.7rem" }}>{shortRef(b.id)}</span>
+                </div>
+                <BookingBadges b={b} small />
+                {(b.status === "reserved" || b.status === "checked_in") && (
+                  <div style={{ display: "flex", gap: 6, marginTop: 10 }}>{renderActions(b, true)}</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <div style={{ background: "#fff", border: `1px solid ${TOKENS.paperDim}`, borderRadius: 10, overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 860 }}>
+            <thead>
+              <tr>
+                <th style={th}>Room</th>
+                <th style={th}>Guest</th>
+                <th style={th}>Dates</th>
+                <th style={th}>Nights</th>
+                <th style={th}>Channel / Payment</th>
+                <th style={th}>Status</th>
+                <th style={{ ...th, textAlign: "right" }}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleRows.map((b) => {
+                const meta = BOOKING_STATUS_META[b.status] || BOOKING_STATUS_META.reserved;
+                const n = nightsBetween(b.checkIn, b.checkOut);
+                return (
+                  <tr key={b.id} className="gx-row" style={{ cursor: "default" }}>
+                    <td style={{ ...td, fontWeight: 700, whiteSpace: "nowrap" }}>{b.roomNumber || <span style={{ color: TOKENS.dirty, fontWeight: 600 }}>No room yet</span>}</td>
+                    <td style={td}>
+                      <div style={{ fontWeight: 600 }}>{guestName(b.guestId)}</div>
+                      <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft }}>{shortRef(b.id)}</div>
+                    </td>
+                    <td style={{ ...td, whiteSpace: "nowrap" }}>
+                      {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)}
+                    </td>
+                    <td style={{ ...td, color: TOKENS.inkSoft }}>{n || "—"}</td>
+                    <td style={td}>
+                      <BookingBadges b={b} small />
+                    </td>
+                    <td style={td}>
+                      <SoftBadge small color={meta.color} bg={meta.bg}>
+                        {meta.label}
+                      </SoftBadge>
+                    </td>
+                    <td style={{ ...td, textAlign: "right" }}>
+                      <div style={{ display: "inline-flex", gap: 6 }}>{renderActions(b, false)}</div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       )}
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {bookings.map((b) => (
-          <div key={b.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-            <div>
-              <div style={{ fontWeight: 600 }}>
-                {roomLabel(b.roomNumber)} · {guestName(b.guestId)}
-              </div>
-              <div style={{ fontSize: "0.8rem", color: TOKENS.inkSoft, marginBottom: 4 }}>
-                {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)} ·{" "}
-                {b.status === "checked_in" ? "In house" : "Reserved"}
-              </div>
-              <span
-                style={{
-                  display: "inline-flex",
-                  fontSize: "0.68rem",
-                  fontWeight: 600,
-                  color: bookingTypeMeta(b.bookingType).color,
-                  background: bookingTypeMeta(b.bookingType).bg,
-                  borderRadius: 999,
-                  padding: "2px 8px",
-                }}
-              >
-                {bookingTypeMeta(b.bookingType).label}
-              </span>
-              {b.paymentMethod && (
-                <span style={{ display: "inline-flex", fontSize: "0.68rem", color: TOKENS.inkSoft, border: `1px solid ${TOKENS.paperDim}`, borderRadius: 999, padding: "2px 8px", marginLeft: 6 }}>
-                  {paymentMethodLabel(b.paymentMethod)}
-                </span>
-              )}
-            </div>
-            <div style={{ display: "flex", gap: 6 }}>
-              {b.status === "reserved" && (
-                <>
-                  <button onClick={() => setEditingId(b.id)} style={ghostBtn}>
-                    Edit
-                  </button>
-                  <button onClick={() => (b.roomNumber ? onCheckIn(b.id) : setEditingId(b.id))} style={primaryBtn} title={b.roomNumber ? "" : "Choose a room first"}>
-                    Check in
-                  </button>
-                  <button onClick={() => onCancel(b.id)} style={ghostBtn}>
-                    Cancel
-                  </button>
-                </>
-              )}
-              {b.status === "checked_in" && (
-                <>
-                  <button onClick={() => setEditingId(b.id)} style={ghostBtn}>
-                    Edit
-                  </button>
-                  <button onClick={() => setSwitchingId(b.id)} style={ghostBtn}>
-                    Switch
-                  </button>
-                  <button onClick={() => onCheckOut(b.id)} style={primaryBtn}>
-                    Check out
-                  </button>
-                </>
-              )}
-            </div>
-          </div>
-        ))}
-      </div>
+      {!loading && listRows.length > 0 && (
+        <GuestsPagination page={bSafePage} pageCount={bPageCount} total={listRows.length} pageSize={bPageSize} setPage={setBPage} setPageSize={setBPageSize} mobile={mobile} />
+      )}
 
       {editingId && allBookings.find((b) => b.id === editingId) && (
         <EditBookingModal
@@ -3153,6 +3866,32 @@ function BookingsTab({ bookings, allBookings, rooms, guests, guestName, onCheckI
             setSwitchingId(null);
           }}
           onClose={() => setSwitchingId(null)}
+        />
+      )}
+
+      {toast && (
+        <div role="alert" style={{ position: "fixed", left: "50%", transform: "translateX(-50%)", bottom: mobile ? 92 : 28, zIndex: 80, background: "#FDF0D5", border: "1px solid #E8C97A", color: "#7A5A12", borderRadius: 12, padding: "0.65rem 0.9rem", maxWidth: "92vw", display: "flex", gap: 8, alignItems: "center", boxShadow: "0 8px 24px rgba(0,0,0,0.18)", fontSize: "0.85rem", fontWeight: 500 }}>
+          <Ico name="alert" size={16} /> {toast}
+        </div>
+      )}
+
+      {confirm && (
+        <ConfirmModal
+          title={confirm.kind === "checkout" ? "Check out guest?" : "Cancel this reservation?"}
+          message={
+            confirm.kind === "checkout"
+              ? `${guestName(confirm.booking.guestId)} will be checked out of ${roomLabel(confirm.booking.roomNumber)}. The room will be marked as needing cleaning.`
+              : `${guestName(confirm.booking.guestId)} · ${roomLabel(confirm.booking.roomNumber)} · ${fmtDate(confirm.booking.checkIn)} → ${fmtDate(confirm.booking.checkOut)} will be cancelled.`
+          }
+          confirmLabel={confirm.kind === "checkout" ? "Check out" : "Cancel reservation"}
+          cancelLabel={confirm.kind === "checkout" ? "Not yet" : "Keep it"}
+          danger={confirm.kind === "cancel"}
+          onConfirm={() => {
+            if (confirm.kind === "checkout") onCheckOut(confirm.booking.id);
+            else onCancel(confirm.booking.id);
+            setConfirm(null);
+          }}
+          onClose={() => setConfirm(null)}
         />
       )}
     </div>
@@ -3472,14 +4211,464 @@ function SwitchRoomModal({ booking, rooms, allBookings, guestName, onSwitch, onC
   );
 }
 
-function GuestsTab({ guests, search, setSearch, showNew, setShowNew, onCreate, bookings, rooms }) {
+// ───────────────────────── Guests page (responsive) ─────────────────────────
+
+const GUESTS_CSS = `
+@keyframes gxFade { from { opacity: 0 } to { opacity: 1 } }
+@keyframes nbSlide { from { transform: translateX(100%) } to { transform: translateX(0) } }
+@keyframes nbSpin { to { transform: rotate(360deg) } }
+@keyframes gxSlideRight { from { transform: translateX(100%) } to { transform: translateX(0) } }
+@keyframes gxSlideUp { from { transform: translateY(100%) } to { transform: translateY(0) } }
+@keyframes gxShimmer { 0% { background-position: -200px 0 } 100% { background-position: calc(200px + 100%) 0 } }
+.gx-row { cursor: pointer; transition: background .12s; }
+.gx-row:hover { background: #FBF8F3; }
+.gx-card { cursor: pointer; transition: box-shadow .12s, transform .12s; }
+.gx-card:active { transform: scale(.995); }
+.gx-skel { background: linear-gradient(90deg, #EFE8DC 0px, #F8F4EC 100px, #EFE8DC 200px); background-size: 200px 100%; background-repeat: no-repeat; background-color: #EFE8DC; animation: gxShimmer 1.2s infinite linear; border-radius: 6px; }
+.gx-btn:focus-visible, .gx-row:focus-visible, .gx-card:focus-visible { outline: 2px solid #B08968; outline-offset: 2px; }
+`;
+
+const ICON_PATHS = {
+  search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+  x: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
+  filter: '<polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>',
+  phone: '<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"/>',
+  mail: '<rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/>',
+  star: '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>',
+  repeat: '<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>',
+  ban: '<circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/>',
+  home: '<path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
+  left: '<path d="m15 18-6-6 6-6"/>',
+  right: '<path d="m9 18 6-6-6-6"/>',
+  users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  id: '<rect width="18" height="14" x="3" y="5" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M14 10h4"/><path d="M14 14h4"/><path d="M6 17c.5-1.5 1.7-2 3-2s2.5.5 3 2"/>',
+  calendar: '<rect width="18" height="18" x="3" y="4" rx="2"/><path d="M16 2v4"/><path d="M8 2v4"/><path d="M3 10h18"/>',
+  check: '<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+  bed: '<path d="M2 4v16"/><path d="M2 8h18a2 2 0 0 1 2 2v10"/><path d="M2 17h20"/><path d="M6 8v9"/>',
+  sparkles: '<path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z"/>',
+  wrench: '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  eye: '<path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>',
+  history: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
+  alert: '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+  plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
+  edit: '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>',
+  logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>',
+  login: '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" x2="3" y1="12" y2="12"/>',
+  inbox: '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
+  moon: '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+  swap: '<path d="m16 3 4 4-4 4"/><path d="M20 7H4"/><path d="m8 21-4-4 4-4"/><path d="M4 17h16"/>',
+};
+function Ico({ name, size = 14, color = "currentColor", style }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke={color}
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      style={{ flexShrink: 0, ...style }}
+      aria-hidden="true"
+      dangerouslySetInnerHTML={{ __html: ICON_PATHS[name] || "" }}
+    />
+  );
+}
+
+function useIsMobile(breakpoint = 768) {
+  const query = `(max-width: ${breakpoint - 1}px)`;
+  const [mobile, setMobile] = useState(() => typeof window !== "undefined" && window.matchMedia(query).matches);
+  useEffect(() => {
+    const mq = window.matchMedia(query);
+    const onChange = (e) => setMobile(e.matches);
+    setMobile(mq.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, [query]);
+  return mobile;
+}
+
+const GUEST_BADGES = {
+  inhouse: { label: "In-House", color: TOKENS.clean, bg: TOKENS.cleanBg, icon: "home" },
+  vip: { label: "VIP", color: "#8A5A00", bg: "#F8E9C8", icon: "star" },
+  repeat: { label: "Repeat Guest", color: TOKENS.reserved, bg: TOKENS.reservedBg, icon: "repeat" },
+  blacklisted: { label: "Blacklisted", color: TOKENS.oos, bg: TOKENS.oosBg, icon: "ban" },
+};
+const RES_STATUS_META = {
+  reserved: { label: "Reserved", color: TOKENS.reserved, bg: TOKENS.reservedBg },
+  checked_in: { label: "Checked in", color: TOKENS.clean, bg: TOKENS.cleanBg },
+  checked_out: { label: "Checked out", color: TOKENS.occupied, bg: TOKENS.occupiedBg },
+  cancelled: { label: "Cancelled", color: TOKENS.oos, bg: TOKENS.oosBg },
+};
+
+function SoftBadge({ color, bg, icon, children, small }) {
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 4,
+        fontSize: small ? "0.66rem" : "0.7rem",
+        fontWeight: 600,
+        color,
+        background: bg,
+        borderRadius: 999,
+        padding: small ? "2px 7px" : "3px 9px",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {icon && <Ico name={icon} size={small ? 10 : 11} />}
+      {children}
+    </span>
+  );
+}
+
+function fmtDateY(iso) {
+  if (!iso) return "—";
+  return new Date(iso + "T00:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+function nightsBetween(ci, co) {
+  const n = Math.round((new Date(co + "T00:00:00") - new Date(ci + "T00:00:00")) / 86400000);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function computeGuestStats(guest, mine) {
+  const history = [...mine].sort((a, b) => b.checkIn.localeCompare(a.checkIn));
+  const live = history.filter((b) => b.status !== "cancelled");
+  const spent = live.reduce((sum, b) => sum + (Number(b.totalAmount) || 0), 0);
+  const stay = history.find((b) => b.status === "checked_in");
+  const roomCount = {};
+  live.forEach((b) => {
+    if (b.roomNumber) roomCount[b.roomNumber] = (roomCount[b.roomNumber] || 0) + 1;
+  });
+  const top = Object.entries(roomCount).sort((a, b) => b[1] - a[1])[0];
+  const tags = splitGuestNotes(guest.notes).tags;
+  return {
+    history,
+    live,
+    count: live.length,
+    spent,
+    isInHouse: !!stay,
+    inHouseRoom: stay ? stay.roomNumber : null,
+    preferredRoom: top ? top[0] : null,
+    vip: tags.includes("vip"),
+    blacklisted: tags.includes("blacklisted"),
+    repeat: live.length >= 2,
+    lastStay: live.length ? live[0].checkIn : "",
+  };
+}
+
+function guestBadgeList(st) {
+  const list = [];
+  if (st.blacklisted) list.push("blacklisted");
+  if (st.isInHouse) list.push("inhouse");
+  if (st.vip) list.push("vip");
+  if (st.repeat) list.push("repeat");
+  return list;
+}
+
+function GuestBadges({ st, small }) {
+  const list = guestBadgeList(st);
+  if (list.length === 0) return null;
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+      {list.map((k) => (
+        <SoftBadge key={k} small={small} color={GUEST_BADGES[k].color} bg={GUEST_BADGES[k].bg} icon={GUEST_BADGES[k].icon}>
+          {GUEST_BADGES[k].label}
+        </SoftBadge>
+      ))}
+    </div>
+  );
+}
+
+function GuestsSkeleton({ mobile }) {
+  const rows = Array.from({ length: 5 });
+  if (mobile) {
+    return (
+      <div>
+        {rows.map((_, i) => (
+          <div key={i} style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: 8 }}>
+            <div className="gx-skel" style={{ height: 16, width: "55%" }} />
+            <div className="gx-skel" style={{ height: 12, width: "35%" }} />
+            <div className="gx-skel" style={{ height: 12, width: "70%" }} />
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return (
+    <div style={{ ...cardStyle, padding: 0 }}>
+      {rows.map((_, i) => (
+        <div key={i} style={{ display: "flex", gap: 16, padding: "1rem", borderTop: i ? `1px solid ${TOKENS.paperDim}` : "none" }}>
+          <div className="gx-skel" style={{ height: 16, flex: 2 }} />
+          <div className="gx-skel" style={{ height: 16, flex: 2 }} />
+          <div className="gx-skel" style={{ height: 16, flex: 1 }} />
+          <div className="gx-skel" style={{ height: 16, flex: 1 }} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function GuestsPagination({ page, pageCount, total, pageSize, setPage, setPageSize, mobile }) {
+  if (total === 0) return null;
+  const from = (page - 1) * pageSize + 1;
+  const to = Math.min(total, page * pageSize);
+  const set = new Set([1, pageCount, page - 1, page, page + 1]);
+  const nums = [...set].filter((n) => n >= 1 && n <= pageCount).sort((a, b) => a - b);
+  const items = [];
+  nums.forEach((n, i) => {
+    if (i > 0 && n - nums[i - 1] > 1) items.push("…" + n);
+    items.push(n);
+  });
+  const navBtn = (disabled) => ({ ...ghostBtn, padding: "0.4rem 0.6rem", display: "inline-flex", alignItems: "center", opacity: disabled ? 0.4 : 1, background: "#fff" });
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 10, marginTop: 12 }}>
+      <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft }}>
+        Showing {from}–{to} of {total}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+        {!mobile && (
+          <select value={pageSize} onChange={(e) => setPageSize(Number(e.target.value))} style={{ ...inputStyle, padding: "0.35rem 0.5rem", marginRight: 6 }} aria-label="Rows per page">
+            {[10, 25, 50].map((n) => (
+              <option key={n} value={n}>
+                {n} / page
+              </option>
+            ))}
+          </select>
+        )}
+        <button className="gx-btn" onClick={() => setPage(page - 1)} disabled={page <= 1} style={navBtn(page <= 1)} aria-label="Previous page">
+          <Ico name="left" size={14} />
+        </button>
+        {mobile ? (
+          <span style={{ fontSize: "0.8rem", color: TOKENS.ink, padding: "0 6px" }}>
+            Page {page} / {pageCount}
+          </span>
+        ) : (
+          items.map((it) =>
+            typeof it === "string" ? (
+              <span key={it} style={{ color: TOKENS.inkSoft, padding: "0 2px" }}>
+                …
+              </span>
+            ) : (
+              <button
+                key={it}
+                className="gx-btn"
+                onClick={() => setPage(it)}
+                style={{
+                  ...ghostBtn,
+                  padding: "0.35rem 0.65rem",
+                  minWidth: 34,
+                  background: it === page ? TOKENS.ink : "#fff",
+                  color: it === page ? TOKENS.paper : TOKENS.inkSoft,
+                  borderColor: it === page ? TOKENS.ink : TOKENS.paperDim,
+                }}
+                aria-current={it === page ? "page" : undefined}
+              >
+                {it}
+              </button>
+            )
+          )
+        )}
+        <button className="gx-btn" onClick={() => setPage(page + 1)} disabled={page >= pageCount} style={navBtn(page >= pageCount)} aria-label="Next page">
+          <Ico name="right" size={14} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function GuestDrawer({ guest, st, mobile, onClose, onToggleTag }) {
+  useEffect(() => {
+    const onKey = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [onClose]);
+
+  const notes = splitGuestNotes(guest.notes);
+  const tile = { background: TOKENS.paper, borderRadius: 10, padding: "0.65rem 0.75rem", flex: "1 1 0", minWidth: 0 };
+  const tileLabel = { fontSize: "0.68rem", color: TOKENS.inkSoft, marginBottom: 2 };
+  const tileValue = { fontWeight: 700, fontSize: "1rem", color: TOKENS.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" };
+  const infoRow = { display: "flex", alignItems: "center", gap: 8, fontSize: "0.84rem", color: TOKENS.ink, marginBottom: 6 };
+
+  const panelStyle = mobile
+    ? {
+        position: "fixed",
+        left: 0,
+        right: 0,
+        bottom: 0,
+        height: "92vh",
+        borderRadius: "16px 16px 0 0",
+        animation: "gxSlideUp .22s ease-out",
+      }
+    : { position: "fixed", top: 0, right: 0, bottom: 0, width: 460, maxWidth: "100vw", animation: "gxSlideRight .22s ease-out" };
+
+  return (
+    <div
+      onClick={onClose}
+      style={{ position: "fixed", inset: 0, background: "rgba(27,36,48,0.45)", zIndex: 70, animation: "gxFade .15s ease-out" }}
+      role="presentation"
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Guest details: ${guest.name}`}
+        onClick={(e) => e.stopPropagation()}
+        style={{ ...panelStyle, background: "#fff", display: "flex", flexDirection: "column", boxShadow: "0 0 40px rgba(0,0,0,0.2)" }}
+      >
+        {mobile && <div style={{ width: 40, height: 4, borderRadius: 4, background: TOKENS.paperDim, margin: "8px auto 0" }} />}
+
+        <div style={{ padding: "1rem 1.1rem 0.75rem", borderBottom: `1px solid ${TOKENS.paperDim}`, display: "flex", gap: 10, alignItems: "flex-start" }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontFamily: "Fraunces, serif", fontSize: "1.2rem", fontWeight: 600, wordBreak: "break-word" }}>{guest.name}</div>
+            <div style={{ marginTop: 6 }}>
+              <GuestBadges st={st} />
+            </div>
+            {st.isInHouse && (
+              <div style={{ fontSize: "0.76rem", color: TOKENS.brassDark, marginTop: 6 }}>Currently in {roomLabel(st.inHouseRoom).toLowerCase()}</div>
+            )}
+          </div>
+          <button className="gx-btn" onClick={onClose} aria-label="Close" style={{ ...ghostBtn, padding: "0.4rem", display: "inline-flex" }}>
+            <Ico name="x" size={16} />
+          </button>
+        </div>
+
+        <div style={{ overflowY: "auto", padding: "1rem 1.1rem 1.5rem", flex: 1 }}>
+          <div style={{ marginBottom: "1rem" }}>
+            <div style={infoRow}>
+              <Ico name="phone" color={TOKENS.inkSoft} />
+              {guest.phone || <span style={{ color: TOKENS.inkSoft }}>No phone</span>}
+            </div>
+            <div style={infoRow}>
+              <Ico name="mail" color={TOKENS.inkSoft} />
+              {guest.email || <span style={{ color: TOKENS.inkSoft }}>No email</span>}
+            </div>
+            <div style={infoRow}>
+              <Ico name="id" color={TOKENS.inkSoft} />
+              {guest.nationalId ? `ID / Passport: ${guest.nationalId}` : <span style={{ color: TOKENS.inkSoft }}>No ID on file</span>}
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginBottom: "1rem" }}>
+            <div style={tile}>
+              <div style={tileLabel}>Total bookings</div>
+              <div style={tileValue}>{st.count}</div>
+            </div>
+            <div style={tile}>
+              <div style={tileLabel}>Total spent</div>
+              <div style={tileValue}>{fmtMoney(st.spent)}</div>
+            </div>
+            <div style={tile}>
+              <div style={tileLabel}>Preferred room</div>
+              <div style={tileValue}>{st.preferredRoom || "—"}</div>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: "1rem" }}>
+            <button
+              className="gx-btn"
+              onClick={() => onToggleTag("vip")}
+              style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 6, fontSize: "0.78rem", background: st.vip ? GUEST_BADGES.vip.bg : "#fff", color: st.vip ? GUEST_BADGES.vip.color : TOKENS.inkSoft }}
+            >
+              <Ico name="star" size={13} /> {st.vip ? "Remove VIP" : "Mark as VIP"}
+            </button>
+            <button
+              className="gx-btn"
+              onClick={() => onToggleTag("blacklisted")}
+              style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 6, fontSize: "0.78rem", background: st.blacklisted ? TOKENS.oosBg : "#fff", color: st.blacklisted ? TOKENS.oos : TOKENS.inkSoft }}
+            >
+              <Ico name="ban" size={13} /> {st.blacklisted ? "Remove from blacklist" : "Blacklist"}
+            </button>
+          </div>
+
+          {notes.plain && (
+            <div style={{ marginBottom: "1rem" }}>
+              <div style={{ fontSize: "0.72rem", fontWeight: 600, color: TOKENS.inkSoft, marginBottom: 4 }}>Notes</div>
+              <div style={{ fontSize: "0.82rem", whiteSpace: "pre-wrap", background: TOKENS.paper, borderRadius: 8, padding: "0.6rem 0.75rem" }}>{notes.plain}</div>
+            </div>
+          )}
+
+          <div style={{ fontSize: "0.72rem", fontWeight: 600, color: TOKENS.inkSoft, marginBottom: 8 }}>Reservation history ({st.history.length})</div>
+          {st.history.length === 0 ? (
+            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>No reservations on record for this guest.</div>
+          ) : (
+            <div style={{ position: "relative", paddingLeft: 18 }}>
+              <div style={{ position: "absolute", left: 5, top: 6, bottom: 6, width: 2, background: TOKENS.paperDim }} />
+              {st.history.map((b) => {
+                const meta = RES_STATUS_META[b.status] || RES_STATUS_META.reserved;
+                const n = nightsBetween(b.checkIn, b.checkOut);
+                const type = bookingTypeMeta(b.bookingType);
+                return (
+                  <div key={b.id} style={{ position: "relative", marginBottom: 10 }}>
+                    <span style={{ position: "absolute", left: -18, top: 14, width: 12, height: 12, borderRadius: "50%", background: meta.color, border: "2px solid #fff", boxSizing: "border-box", boxShadow: `0 0 0 1px ${meta.color}` }} />
+                    <div style={{ border: `1px solid ${TOKENS.paperDim}`, borderRadius: 10, padding: "0.6rem 0.75rem", background: b.status === "cancelled" ? "#FBF7F5" : "#fff" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
+                        <div style={{ fontWeight: 600, fontSize: "0.88rem" }}>{roomLabel(b.roomNumber)}</div>
+                        <SoftBadge small color={meta.color} bg={meta.bg}>
+                          {meta.label}
+                        </SoftBadge>
+                      </div>
+                      <div style={{ fontSize: "0.76rem", color: TOKENS.inkSoft, marginTop: 2, display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
+                        <Ico name="calendar" size={12} />
+                        {fmtDateY(b.checkIn)} → {fmtDateY(b.checkOut)}
+                        {n > 0 && <span>· {n} night{n === 1 ? "" : "s"}</span>}
+                        <span>
+                          · {b.persons || 1} {(b.persons || 1) === 1 ? "person" : "persons"}
+                        </span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+                        <SoftBadge small color={type.color} bg={type.bg}>
+                          {type.label}
+                        </SoftBadge>
+                        {b.paymentMethod && (
+                          <span style={{ fontSize: "0.66rem", color: TOKENS.inkSoft, border: `1px solid ${TOKENS.paperDim}`, borderRadius: 999, padding: "2px 7px" }}>
+                            {paymentMethodLabel(b.paymentMethod)}
+                          </span>
+                        )}
+                        {b.mealPlans && b.mealPlans[0] && <span style={{ fontSize: "0.7rem", color: TOKENS.inkSoft }}>{b.mealPlans[0]}</span>}
+                        {Number(b.totalAmount) > 0 && <span style={{ marginLeft: "auto", fontSize: "0.8rem", fontWeight: 700 }}>{fmtMoney(Number(b.totalAmount))}</span>}
+                      </div>
+                      {(notes.switches[b.id] || []).map((txt, i) => (
+                        <div key={i} style={{ marginTop: 6, fontSize: "0.74rem", color: TOKENS.dirty, background: TOKENS.dirtyBg, borderRadius: 6, padding: "0.35rem 0.55rem", display: "flex", gap: 6, alignItems: "flex-start" }}>
+                          <Ico name="swap" size={12} style={{ marginTop: 2 }} />
+                          <span>Room switch: {txt}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GuestsTab({ guests, search, setSearch, showNew, setShowNew, onCreate, bookings, rooms, onUpdateTags, loading = false }) {
+  const mobile = useIsMobile();
   const [form, setForm] = useState({ name: "", phone: "", email: "", nationalId: "", notes: "" });
   const [formError, setFormError] = useState("");
-  const [expandedGuestId, setExpandedGuestId] = useState(null);
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [sortBy, setSortBy] = useState("name");
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+  const [openGuestId, setOpenGuestId] = useState(null);
 
   const submit = () => {
     setFormError("");
-    if (!form.name) return;
+    if (!form.name.trim()) return;
     const nameQ = form.name.trim().toLowerCase();
     const idQ = (form.nationalId || "").trim().toLowerCase();
     const duplicate = guests.find(
@@ -3493,29 +4682,95 @@ function GuestsTab({ guests, search, setSearch, showNew, setShowNew, onCreate, b
     setForm({ name: "", phone: "", email: "", nationalId: "", notes: "" });
   };
 
-  const guestRoom = (guestId) => {
-    const b = bookings.find((bk) => bk.guestId === guestId && bk.status === "checked_in");
-    return b ? b.roomNumber : null;
+  const bookingsByGuest = useMemo(() => {
+    const map = {};
+    bookings.forEach((b) => (map[b.guestId] = map[b.guestId] || []).push(b));
+    return map;
+  }, [bookings]);
+
+  const rows = useMemo(() => guests.map((g) => ({ g, st: computeGuestStats(g, bookingsByGuest[g.id] || []) })), [guests, bookingsByGuest]);
+
+  const filtered = useMemo(() => {
+    let list = rows.filter(({ st }) => {
+      if (statusFilter === "inhouse" && !st.isInHouse) return false;
+      if (statusFilter === "vip" && !st.vip) return false;
+      if (statusFilter === "repeat" && !st.repeat) return false;
+      if (statusFilter === "blacklisted" && !st.blacklisted) return false;
+      if (dateFrom || dateTo) {
+        const hit = st.live.some((b) => (!dateTo || b.checkIn <= dateTo) && (!dateFrom || b.checkOut >= dateFrom));
+        if (!hit) return false;
+      }
+      return true;
+    });
+    if (sortBy === "ltv") list = [...list].sort((a, b) => b.st.spent - a.st.spent);
+    else if (sortBy === "recent") list = [...list].sort((a, b) => (b.st.lastStay || "").localeCompare(a.st.lastStay || ""));
+    return list;
+  }, [rows, statusFilter, dateFrom, dateTo, sortBy]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search, statusFilter, dateFrom, dateTo, sortBy, pageSize]);
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage = Math.min(page, pageCount);
+  const visible = filtered.slice((safePage - 1) * pageSize, safePage * pageSize);
+
+  const activeFilterCount = (statusFilter !== "all" ? 1 : 0) + (dateFrom || dateTo ? 1 : 0) + (sortBy !== "name" ? 1 : 0);
+  const hasAnyFilter = activeFilterCount > 0 || search.trim() !== "";
+  const clearAll = () => {
+    setSearch("");
+    setStatusFilter("all");
+    setDateFrom("");
+    setDateTo("");
+    setSortBy("name");
   };
 
-  const guestBookings = (guestId) =>
-    bookings.filter((bk) => bk.guestId === guestId).sort((a, b) => b.checkIn.localeCompare(a.checkIn));
+  const openRow = rows.find((r) => r.g.id === openGuestId);
+
+  const filterControls = (
+    <>
+      <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} style={{ ...inputStyle, minWidth: 0 }} aria-label="Status filter">
+        <option value="all">All statuses</option>
+        <option value="inhouse">In-House</option>
+        <option value="vip">VIP</option>
+        <option value="repeat">Repeat Guest</option>
+        <option value="blacklisted">Blacklisted</option>
+      </select>
+      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.72rem", color: TOKENS.inkSoft }}>
+        Stay from
+        <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 0 }} />
+      </label>
+      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.72rem", color: TOKENS.inkSoft }}>
+        to
+        <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 0 }} />
+      </label>
+      <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} style={{ ...inputStyle, minWidth: 0 }} aria-label="Sort">
+        <option value="name">Sort: Name A–Z</option>
+        <option value="ltv">Sort: Highest spent</option>
+        <option value="recent">Sort: Latest stay</option>
+      </select>
+    </>
+  );
+
+  const th = { textAlign: "left", fontSize: "0.7rem", fontWeight: 600, color: TOKENS.inkSoft, padding: "0.65rem 0.9rem", background: "#FBF8F3", whiteSpace: "nowrap" };
+  const td = { padding: "0.75rem 0.9rem", fontSize: "0.84rem", verticalAlign: "middle", borderTop: `1px solid ${TOKENS.paperDim}` };
 
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem", flexWrap: "wrap", gap: 8 }}>
-        <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", margin: 0 }}>Guests</h2>
-        <div style={{ display: "flex", gap: 8 }}>
-          <input placeholder="Search guests…" value={search} onChange={(e) => setSearch(e.target.value)} style={{ ...inputStyle, width: 180 }} />
-          <button onClick={() => setShowNew(!showNew)} style={primaryBtn}>
-            {showNew ? "Cancel" : "Add guest"}
-          </button>
-        </div>
+      <style>{GUESTS_CSS}</style>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.9rem", gap: 8 }}>
+        <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", margin: 0 }}>
+          Guests <span style={{ fontFamily: "Inter, sans-serif", fontSize: "0.78rem", color: TOKENS.inkSoft, fontWeight: 400 }}>({filtered.length})</span>
+        </h2>
+        <button onClick={() => setShowNew(!showNew)} style={primaryBtn}>
+          {showNew ? "Cancel" : "Add guest"}
+        </button>
       </div>
 
       {showNew && (
         <div style={cardStyle}>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.75rem", marginBottom: "0.75rem" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "0.75rem", marginBottom: "0.75rem" }}>
             <input placeholder="Full name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} style={inputStyle} />
             <input placeholder="National ID / passport number" value={form.nationalId} onChange={(e) => setForm({ ...form, nationalId: e.target.value })} style={inputStyle} />
             <input placeholder="Phone" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} style={inputStyle} />
@@ -3523,9 +4778,7 @@ function GuestsTab({ guests, search, setSearch, showNew, setShowNew, onCreate, b
             <input placeholder="Notes (preferences, etc.)" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} style={{ ...inputStyle, gridColumn: "1 / -1" }} />
           </div>
           {formError && (
-            <div style={{ fontSize: "0.8rem", color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginBottom: "0.75rem" }}>
-              ⚠ {formError}
-            </div>
+            <div style={{ fontSize: "0.8rem", color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginBottom: "0.75rem" }}>⚠ {formError}</div>
           )}
           <button onClick={submit} style={primaryBtn}>
             Save guest
@@ -3533,394 +4786,562 @@ function GuestsTab({ guests, search, setSearch, showNew, setShowNew, onCreate, b
         </div>
       )}
 
-      {guests.length === 0 && <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem" }}>No guests yet.</div>}
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {guests.map((g) => {
-          const room = guestRoom(g.id);
-          const history = guestBookings(g.id);
-          const isExpanded = expandedGuestId === g.id;
-          return (
-            <div key={g.id} style={cardStyle}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
-                <div>
-                  <div style={{ fontWeight: 600 }}>{g.name}</div>
-                  <div style={{ fontSize: "0.8rem", color: TOKENS.inkSoft }}>
-                    {[g.phone, g.email].filter(Boolean).join(" · ") || "No contact info"}
-                  </div>
-                  {g.nationalId && (
-                    <div style={{ fontSize: "0.76rem", color: TOKENS.inkSoft, marginTop: 2 }}>ID: {g.nationalId}</div>
-                  )}
-                  {splitGuestNotes(g.notes).plain && (
-                    <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, marginTop: 4, whiteSpace: "pre-wrap" }}>{splitGuestNotes(g.notes).plain}</div>
-                  )}
-                </div>
-                {room && <Pill status="occupied" />}
-              </div>
-              {room && <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, marginTop: 6 }}>Currently in room {room}</div>}
-              <button
-                onClick={() => setExpandedGuestId(isExpanded ? null : g.id)}
-                style={{ ...ghostBtn, marginTop: 8, fontSize: "0.75rem", padding: "0.35rem 0.75rem" }}
-              >
-                {isExpanded ? "Hide reservations" : `View reservations (${history.length})`}
+      {/* Search + filters */}
+      <div style={{ ...cardStyle, padding: "0.65rem", marginBottom: 12 }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: mobile ? "nowrap" : "wrap" }}>
+          <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
+            <Ico name="search" size={15} color={TOKENS.inkSoft} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", pointerEvents: "none" }} />
+            <input
+              placeholder="Search name, phone, email or ID…"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              style={{ ...inputStyle, width: "100%", boxSizing: "border-box", paddingLeft: 32, paddingRight: search ? 30 : undefined }}
+            />
+            {search && (
+              <button className="gx-btn" onClick={() => setSearch("")} aria-label="Clear search" style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", border: "none", background: "none", cursor: "pointer", display: "inline-flex", color: TOKENS.inkSoft }}>
+                <Ico name="x" size={14} />
               </button>
-              {isExpanded && (
-                <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>
-                  {history.length === 0 && (
-                    <div style={{ color: TOKENS.inkSoft, fontSize: "0.8rem" }}>No reservations on record for this guest.</div>
-                  )}
-                  {history.map((b) => (
-                    <div key={b.id} style={{ background: TOKENS.paper, border: `1px solid ${TOKENS.paperDim}`, borderRadius: 8, padding: "0.6rem 0.75rem" }}>
-                      <div style={{ fontWeight: 600, fontSize: "0.85rem" }}>
-                        {roomLabel(b.roomNumber)} · {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)}
-                      </div>
-                      <div style={{ fontSize: "0.76rem", color: TOKENS.inkSoft, marginTop: 2 }}>
-                        {b.status === "checked_in" ? "In house" : b.status === "checked_out" ? "Checked out" : b.status === "cancelled" ? "Cancelled" : "Reserved"}
-                        {" · "}
-                        {b.persons || 1} {(b.persons || 1) === 1 ? "person" : "persons"}
-                        {b.mealPlans && b.mealPlans[0] ? ` · ${b.mealPlans[0]}` : ""}
-                        {b.discountPercent > 0 ? ` · ${b.discountPercent}% discount` : ""}
-                      </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
-                        <span
-                          style={{
-                            fontSize: "0.68rem",
-                            fontWeight: 600,
-                            color: bookingTypeMeta(b.bookingType).color,
-                            background: bookingTypeMeta(b.bookingType).bg,
-                            borderRadius: 999,
-                            padding: "2px 8px",
-                          }}
-                        >
-                          {bookingTypeMeta(b.bookingType).label}
-                        </span>
-                        {b.paymentMethod && (
-                          <span style={{ fontSize: "0.68rem", color: TOKENS.inkSoft, border: `1px solid ${TOKENS.paperDim}`, borderRadius: 999, padding: "2px 8px" }}>
-                            {paymentMethodLabel(b.paymentMethod)}
-                          </span>
-                        )}
-                        {Number(b.totalAmount) > 0 && (
-                          <span style={{ fontSize: "0.76rem", color: TOKENS.ink, fontWeight: 600 }}>{fmtMoney(Number(b.totalAmount))}</span>
-                        )}
-                      </div>
-                      {(splitGuestNotes(g.notes).switches[b.id] || []).map((txt, i) => (
-                        <div
-                          key={i}
-                          style={{
-                            marginTop: 6,
-                            fontSize: "0.76rem",
-                            color: TOKENS.dirty,
-                            background: TOKENS.dirtyBg,
-                            borderRadius: 6,
-                            padding: "0.4rem 0.6rem",
-                          }}
-                        >
-                          ⇄ Room switch: {txt}
-                        </div>
-                      ))}
-                    </div>
-                  ))}
-                </div>
+            )}
+          </div>
+          {mobile ? (
+            <button className="gx-btn" onClick={() => setFiltersOpen(!filtersOpen)} style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 6, background: filtersOpen ? TOKENS.paperDim : "#fff" }}>
+              <Ico name="filter" size={14} /> Filters
+              {activeFilterCount > 0 && (
+                <span style={{ background: TOKENS.ink, color: TOKENS.paper, borderRadius: 999, fontSize: "0.65rem", padding: "1px 6px" }}>{activeFilterCount}</span>
               )}
-            </div>
-          );
-        })}
+            </button>
+          ) : (
+            <>
+              {filterControls}
+              {hasAnyFilter && (
+                <button className="gx-btn" onClick={clearAll} style={ghostBtn}>
+                  Clear
+                </button>
+              )}
+            </>
+          )}
+        </div>
+        {mobile && filtersOpen && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 10 }}>
+            {filterControls}
+            {hasAnyFilter && (
+              <button className="gx-btn" onClick={clearAll} style={ghostBtn}>
+                Clear all
+              </button>
+            )}
+          </div>
+        )}
       </div>
+
+      {loading ? (
+        <GuestsSkeleton mobile={mobile} />
+      ) : filtered.length === 0 ? (
+        <div style={{ ...cardStyle, textAlign: "center", padding: "2.5rem 1rem", color: TOKENS.inkSoft }}>
+          <div style={{ display: "inline-flex", padding: 14, borderRadius: "50%", background: TOKENS.paper, marginBottom: 10 }}>
+            <Ico name="users" size={26} color={TOKENS.brass} />
+          </div>
+          <div style={{ fontWeight: 600, color: TOKENS.ink, marginBottom: 4 }}>{hasAnyFilter ? "No guests match your search" : "No guests yet"}</div>
+          <div style={{ fontSize: "0.82rem", marginBottom: 12 }}>
+            {hasAnyFilter ? "Try a different name, phone or ID, or clear the filters." : "Add your first guest, or create a booking with a new guest."}
+          </div>
+          {hasAnyFilter ? (
+            <button onClick={clearAll} style={ghostBtn}>
+              Clear search & filters
+            </button>
+          ) : (
+            <button onClick={() => setShowNew(true)} style={primaryBtn}>
+              Add guest
+            </button>
+          )}
+        </div>
+      ) : mobile ? (
+        <div>
+          {visible.map(({ g, st }) => (
+            <div
+              key={g.id}
+              className="gx-card"
+              tabIndex={0}
+              role="button"
+              onClick={() => setOpenGuestId(g.id)}
+              onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && setOpenGuestId(g.id)}
+              style={{ ...cardStyle, borderColor: st.blacklisted ? "#E7BEBE" : TOKENS.paperDim }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
+                <div style={{ fontWeight: 600, wordBreak: "break-word" }}>{g.name}</div>
+                <div style={{ fontWeight: 700, fontSize: "0.85rem", whiteSpace: "nowrap" }}>{fmtMoney(st.spent)}</div>
+              </div>
+              <div style={{ margin: "6px 0" }}>
+                <GuestBadges st={st} small />
+              </div>
+              <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft, display: "flex", flexDirection: "column", gap: 3 }}>
+                <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <Ico name="phone" size={12} /> {g.phone || "No phone"}
+                </span>
+                {st.isInHouse && <span style={{ color: TOKENS.brassDark }}>Currently in {roomLabel(st.inHouseRoom).toLowerCase()}</span>}
+              </div>
+              <button
+                className="gx-btn"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setOpenGuestId(g.id);
+                }}
+                style={{ ...ghostBtn, width: "100%", marginTop: 10, fontSize: "0.78rem", padding: "0.5rem" }}
+              >
+                View details
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div style={{ background: "#fff", border: `1px solid ${TOKENS.paperDim}`, borderRadius: 10, overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 760 }}>
+            <thead>
+              <tr>
+                <th style={th}>Guest</th>
+                <th style={th}>Contact</th>
+                <th style={th}>ID / Passport</th>
+                <th style={th}>Status</th>
+                <th style={{ ...th, textAlign: "right" }}>Lifetime value</th>
+                <th style={th}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {visible.map(({ g, st }) => (
+                <tr key={g.id} className="gx-row" tabIndex={0} onClick={() => setOpenGuestId(g.id)} onKeyDown={(e) => e.key === "Enter" && setOpenGuestId(g.id)}>
+                  <td style={td}>
+                    <div style={{ fontWeight: 600 }}>{g.name}</div>
+                    {st.isInHouse && <div style={{ fontSize: "0.72rem", color: TOKENS.brassDark, marginTop: 2 }}>In {roomLabel(st.inHouseRoom).toLowerCase()}</div>}
+                  </td>
+                  <td style={{ ...td, color: TOKENS.inkSoft, fontSize: "0.8rem" }}>
+                    <div>{g.phone || "—"}</div>
+                    <div>{g.email || ""}</div>
+                  </td>
+                  <td style={{ ...td, fontSize: "0.8rem" }}>{g.nationalId || <span style={{ color: TOKENS.inkSoft }}>—</span>}</td>
+                  <td style={td}>
+                    <GuestBadges st={st} small />
+                  </td>
+                  <td style={{ ...td, textAlign: "right", fontWeight: 700 }}>{fmtMoney(st.spent)}</td>
+                  <td style={{ ...td, textAlign: "right" }}>
+                    <button
+                      className="gx-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setOpenGuestId(g.id);
+                      }}
+                      style={{ ...ghostBtn, fontSize: "0.75rem", padding: "0.35rem 0.75rem", whiteSpace: "nowrap" }}
+                    >
+                      View details
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {!loading && filtered.length > 0 && (
+        <GuestsPagination page={safePage} pageCount={pageCount} total={filtered.length} pageSize={pageSize} setPage={setPage} setPageSize={setPageSize} mobile={mobile} />
+      )}
+
+      {openRow && (
+        <GuestDrawer
+          guest={openRow.g}
+          st={openRow.st}
+          mobile={mobile}
+          onClose={() => setOpenGuestId(null)}
+          onToggleTag={(tag) => {
+            const cur = splitGuestNotes(openRow.g.notes).tags;
+            onUpdateTags(openRow.g.id, cur.includes(tag) ? cur.filter((t) => t !== tag) : [...cur, tag]);
+          }}
+        />
+      )}
     </div>
   );
 }
 
-function HousekeepingTab({ rooms, username, onMarkClean, checkoutCounts, onPostponeMaintenance, activeBookingForRoom, guestName, onMarkCleanedToday }) {
-  const needsCleaning = rooms.filter((r) => r.status === "vacant_dirty");
-  const outOfOrder = rooms.filter((r) => r.status === "out_of_order");
-  const needsMaintenance = rooms
-    .filter((r) => (checkoutCounts[r.number] || 0) - (r.maintenanceBaseline || 0) >= MAINTENANCE_THRESHOLD)
-    .sort((a, b) => (checkoutCounts[b.number] || 0) - (checkoutCounts[a.number] || 0));
+// ───────────────────────── Housekeeping page ─────────────────────────
+
+const HK_CSS = `
+.hk-card { transition: background .35s ease, border-color .35s ease, box-shadow .2s ease; }
+.hk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
+@media (max-width: 639px) { .hk-grid { grid-template-columns: minmax(0, 1fr); } }
+@keyframes hkCheck { from { transform: scale(.3); opacity: 0 } to { transform: scale(1); opacity: 1 } }
+.hk-check { animation: hkCheck .3s ease-out both; }
+.hk-btn { min-height: 46px; width: 100%; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: none; border-radius: 10px; font-size: .92rem; font-weight: 600; cursor: pointer; font-family: inherit; transition: transform .1s, filter .15s; }
+.hk-btn:active { transform: scale(.98); }
+.hk-btn:hover { filter: brightness(1.08); }
+.hk-chips { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; -webkit-overflow-scrolling: touch; }
+.hk-chips::-webkit-scrollbar { display: none; }
+`;
+
+function HousekeepingTab({ rooms, username, onMarkClean, checkoutCounts, onPostponeMaintenance, activeBookingForRoom, guestName, onMarkCleanedToday, bookings = [] }) {
   const today = todayISO();
-  const dailyClean = rooms.filter((r) => r.status === "occupied" && r.lastCleanedDate !== today);
+  const isMaintDue = (r) => (checkoutCounts[r.number] || 0) - (r.maintenanceBaseline || 0) >= MAINTENANCE_THRESHOLD;
+
+  const [view, setView] = useState(() => (rooms.some((r) => r.status === "vacant_dirty") ? "checkout" : "occupied"));
+  const [floor, setFloor] = useState("all");
+  const [q, setQ] = useState("");
+  const [flash, setFlash] = useState({ occ: {}, out: {}, maint: {} });
+  const timers = useRef([]);
+  useEffect(() => () => timers.current.forEach(clearTimeout), []);
+
+  const flashDone = (kind, snapshot) => {
+    setFlash((f) => ({ ...f, [kind]: { ...f[kind], [snapshot.number]: snapshot } }));
+    timers.current.push(
+      setTimeout(() => {
+        setFlash((f) => {
+          const copy = { ...f[kind] };
+          delete copy[snapshot.number];
+          return { ...f, [kind]: copy };
+        });
+      }, 1800)
+    );
+  };
+
+  const floors = [...new Set(rooms.map((r) => r.floor))].sort((a, b) => Number(a) - Number(b));
+  const needle = q.trim().toLowerCase();
+  const pass = (r) => (floor === "all" || String(r.floor) === String(floor)) && (!needle || String(r.number).toLowerCase().includes(needle));
+
+  // Occupied rooms: daily service
+  const occupiedAll = rooms.filter((r) => r.status === "occupied" && pass(r));
+  const occDue = occupiedAll.filter((r) => r.lastCleanedDate !== today || flash.occ[r.number]);
+  const occDone = occupiedAll.filter((r) => r.lastCleanedDate === today && !flash.occ[r.number]);
+  const occPendingCount = occupiedAll.filter((r) => r.lastCleanedDate !== today).length;
+
+  // Check-out rooms: turnover cleaning
+  const arrivingToday = (r) => bookings.some((b) => b.roomNumber === r.number && b.status === "reserved" && b.checkIn === today);
+  const outPending = rooms
+    .filter((r) => r.status === "vacant_dirty" && pass(r))
+    .sort((a, b) => Number(arrivingToday(b)) - Number(arrivingToday(a)));
+  const outFlashed = Object.values(flash.out).filter((r) => pass(r) && !outPending.some((x) => x.number === r.number));
+  const lastCheckout = (r) =>
+    bookings
+      .filter((b) => b.roomNumber === r.number && b.status === "checked_out")
+      .sort((a, b) => b.checkOut.localeCompare(a.checkOut))[0];
+
+  // Maintenance
+  const maintDue = rooms.filter((r) => isMaintDue(r) && pass(r)).sort((a, b) => (checkoutCounts[b.number] || 0) - (checkoutCounts[a.number] || 0));
+  const maintFlashed = Object.values(flash.maint).filter((r) => pass(r) && !maintDue.some((x) => x.number === r.number));
+  const outOfOrder = rooms.filter((r) => r.status === "out_of_order" && pass(r));
+
+  const tabs = [
+    { key: "occupied", label: "Occupied cleaning", short: "Occupied", n: occPendingCount, icon: "bed", color: TOKENS.occupied, bg: TOKENS.occupiedBg },
+    { key: "checkout", label: "Check-out cleaning", short: "Check-out", n: outPending.length, icon: "sparkles", color: "#C0502F", bg: "#FBE3D8" },
+    { key: "maintenance", label: "Maintenance needed", short: "Maintenance", n: maintDue.length + outOfOrder.length, icon: "wrench", color: TOKENS.oos, bg: TOKENS.oosBg },
+  ];
+
+  const typeChip = (r) => (
+    <span style={{ fontSize: "0.68rem", fontWeight: 700, color: TOKENS.inkSoft, background: TOKENS.paper, borderRadius: 6, padding: "2px 7px", letterSpacing: "0.03em" }}>{r.type}</span>
+  );
+  const cardBase = (done, accent) => ({
+    background: done ? "#E4F1E7" : "#fff",
+    border: `1px solid ${done ? "#9CC9A8" : TOKENS.paperDim}`,
+    borderLeft: `5px solid ${done ? TOKENS.clean : accent}`,
+    borderRadius: 14,
+    padding: "0.85rem 0.9rem",
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    boxShadow: "0 1px 2px rgba(27,36,48,0.05)",
+  });
+  const roomNumberStyle = { fontFamily: "Fraunces, serif", fontSize: "1.7rem", fontWeight: 700, lineHeight: 1 };
+  const infoLine = { fontSize: "0.8rem", color: TOKENS.inkSoft, display: "flex", alignItems: "center", gap: 6, minWidth: 0 };
+  const DoneTag = ({ text }) => (
+    <span className="hk-check" style={{ display: "inline-flex", alignItems: "center", gap: 5, color: TOKENS.clean, fontWeight: 700, fontSize: "0.85rem" }}>
+      <Ico name="check" size={18} /> {text}
+    </span>
+  );
+  const EmptyState = ({ icon, title, text }) => (
+    <div style={{ ...cardStyle, textAlign: "center", padding: "2.2rem 1rem", color: TOKENS.inkSoft }}>
+      <div style={{ display: "inline-flex", padding: 14, borderRadius: "50%", background: TOKENS.cleanBg, marginBottom: 10 }}>
+        <Ico name={icon} size={26} color={TOKENS.clean} />
+      </div>
+      <div style={{ fontWeight: 600, color: TOKENS.ink, marginBottom: 4 }}>{title}</div>
+      <div style={{ fontSize: "0.82rem" }}>{text}</div>
+    </div>
+  );
+  const sectionLabel = (text, color) => (
+    <div style={{ fontSize: "0.72rem", color, textTransform: "uppercase", letterSpacing: "0.06em", margin: "0 0 8px", fontWeight: 700 }}>{text}</div>
+  );
+
+  const renderOccupiedCard = (r) => {
+    const b = activeBookingForRoom(r.number);
+    const done = r.lastCleanedDate === today;
+    return (
+      <div key={r.number} className="hk-card" style={cardBase(done, TOKENS.occupied)}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+          <div style={roomNumberStyle}>{r.number}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {done && <DoneTag text="Cleaned today" />}
+            {typeChip(r)}
+          </div>
+        </div>
+        {b ? (
+          <>
+            <div style={{ ...infoLine, color: TOKENS.ink, fontWeight: 600, fontSize: "0.9rem" }}>
+              <Ico name="user" size={14} color={TOKENS.inkSoft} />
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{guestName(b.guestId)}</span>
+            </div>
+            <div style={infoLine}>
+              <Ico name="calendar" size={13} /> {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)}
+            </div>
+          </>
+        ) : (
+          <div style={infoLine}>No active booking found</div>
+        )}
+        {!done && (
+          <button
+            className="hk-btn"
+            onClick={() => {
+              onMarkCleanedToday(r.number);
+              flashDone("occ", r);
+            }}
+            style={{ background: TOKENS.ink, color: TOKENS.paper }}
+          >
+            <Ico name="check" size={17} /> Mark cleaned today
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  const renderCheckoutCard = (r, flashed) => {
+    const last = lastCheckout(r);
+    const urgent = arrivingToday(r);
+    return (
+      <div key={r.number} className="hk-card" style={cardBase(flashed, urgent ? "#C0392B" : TOKENS.dirty)}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+          <div style={roomNumberStyle}>{r.number}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {flashed ? (
+              <DoneTag text="Clean & ready" />
+            ) : urgent ? (
+              <SoftBadge color="#B03A2E" bg="#FADBD8" icon="alert">
+                Arriving today
+              </SoftBadge>
+            ) : (
+              <SoftBadge color="#B5651D" bg="#FBE7D2" icon="sparkles">
+                Turnover
+              </SoftBadge>
+            )}
+            {typeChip(r)}
+          </div>
+        </div>
+        {last ? (
+          <div style={infoLine}>
+            <Ico name="user" size={13} />
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              Checked out: {guestName(last.guestId)} · {fmtDate(last.checkOut)}
+            </span>
+          </div>
+        ) : (
+          <div style={infoLine}>Needs full cleaning before the next guest</div>
+        )}
+        {!flashed && (
+          <button
+            className="hk-btn"
+            onClick={() => {
+              onMarkClean(r.number);
+              flashDone("out", { ...r, status: "vacant_clean" });
+            }}
+            style={{ background: urgent ? "#C0392B" : "#C9722B", color: "#fff" }}
+          >
+            <Ico name="sparkles" size={17} /> Clean &amp; ready
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  const renderMaintCard = (r, flashed) => {
+    const since = (checkoutCounts[r.number] || 0) - (r.maintenanceBaseline || 0);
+    return (
+      <div key={r.number} className="hk-card" style={cardBase(flashed, TOKENS.oos)}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+          <div style={roomNumberStyle}>{r.number}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {flashed ? (
+              <DoneTag text="Logged" />
+            ) : (
+              <SoftBadge color={TOKENS.oos} bg={TOKENS.oosBg} icon="wrench">
+                Check due
+              </SoftBadge>
+            )}
+            {typeChip(r)}
+          </div>
+        </div>
+        <div style={infoLine}>
+          <Ico name="alert" size={13} color={TOKENS.oos} />
+          {flashed ? "Maintenance check recorded" : `${since} checkout${since === 1 ? "" : "s"} since last inspection`}
+        </div>
+        {!flashed && (
+          <button
+            className="hk-btn"
+            onClick={() => {
+              onPostponeMaintenance(r.number);
+              flashDone("maint", r);
+            }}
+            style={{ background: "#fff", color: TOKENS.ink, border: `1.5px solid ${TOKENS.ink}` }}
+          >
+            <Ico name="check" size={17} /> Mark done / postpone
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  const doneToday = rooms.filter((r) => r.status === "occupied" && r.lastCleanedDate === today).length;
+  const totalOccupied = rooms.filter((r) => r.status === "occupied").length;
+  const pct = totalOccupied ? Math.round((doneToday / totalOccupied) * 100) : 0;
 
   return (
     <div>
-      <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", marginBottom: "1rem" }}>Housekeeping</h2>
+      <style>{GUESTS_CSS}</style>
+      <style>{HK_CSS}</style>
 
-      <div style={{ fontSize: "0.85rem", color: TOKENS.inkSoft, marginBottom: 12 }}>
-        {needsCleaning.length} room{needsCleaning.length === 1 ? "" : "s"} waiting on cleaning · {dailyClean.length} occupied room{dailyClean.length === 1 ? "" : "s"} due for daily service
+      <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", margin: "0 0 4px" }}>Housekeeping</h2>
+      <div style={{ fontSize: "0.8rem", color: TOKENS.inkSoft, marginBottom: 12 }}>
+        Daily service {doneToday}/{totalOccupied} done
         {username ? ` · logging as ${username}` : ""}
       </div>
 
-      <div style={{ fontSize: "0.75rem", color: TOKENS.occupied, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
-        Daily cleaning — occupied rooms
+      {/* View tabs */}
+      <div className="hk-chips" role="tablist" style={{ marginBottom: 10 }}>
+        {tabs.map((t) => {
+          const act = view === t.key;
+          return (
+            <button
+              key={t.key}
+              role="tab"
+              aria-selected={act}
+              className="gx-btn"
+              onClick={() => setView(t.key)}
+              style={{ ...ghostBtn, flex: "1 0 auto", minHeight: 48, padding: "0.5rem 0.9rem", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 7, whiteSpace: "nowrap", background: act ? t.bg : "#fff", color: act ? t.color : TOKENS.inkSoft, borderColor: act ? t.color : TOKENS.paperDim, fontWeight: act ? 700 : 500, fontSize: "0.88rem" }}
+            >
+              <Ico name={t.icon} size={16} />
+              {t.label}
+              <span style={{ fontSize: "0.72rem", borderRadius: 999, padding: "1px 8px", background: act ? "#fff" : TOKENS.paper, color: act ? t.color : TOKENS.inkSoft, fontWeight: 700 }}>{t.n}</span>
+            </button>
+          );
+        })}
       </div>
-      {dailyClean.length === 0 ? (
-        <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem", marginBottom: "1.5rem" }}>
-          Every occupied room has been serviced today.
+
+      {/* Search + floor filter */}
+      <div style={{ ...cardStyle, padding: "0.6rem", marginBottom: 14 }}>
+        <div style={{ position: "relative", marginBottom: 8 }}>
+          <Ico name="search" size={15} color={TOKENS.inkSoft} style={{ position: "absolute", left: 11, top: "50%", transform: "translateY(-50%)", pointerEvents: "none" }} />
+          <input
+            inputMode="numeric"
+            placeholder="Search room number…"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            style={{ ...inputStyle, width: "100%", boxSizing: "border-box", minHeight: 44, paddingLeft: 34, paddingRight: q ? 36 : undefined, fontSize: "1rem" }}
+          />
+          {q && (
+            <button className="gx-btn" onClick={() => setQ("")} aria-label="Clear search" style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", border: "none", background: "none", cursor: "pointer", display: "inline-flex", padding: 8, color: TOKENS.inkSoft }}>
+              <Ico name="x" size={15} />
+            </button>
+          )}
         </div>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: "1.5rem" }}>
-          {dailyClean.map((r) => {
-            const b = activeBookingForRoom(r.number);
+        <div className="hk-chips">
+          {[{ key: "all", label: "All floors" }, ...floors.map((f) => ({ key: String(f), label: floorLabel(f) }))].map((f) => {
+            const act = String(floor) === f.key;
             return (
-              <div key={r.number} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-                <div>
-                  <div style={{ fontWeight: 600 }}>
-                    Room {r.number} <span style={{ fontWeight: 400, color: TOKENS.inkSoft }}>· {r.type}</span>
-                  </div>
-                  {b && (
-                    <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft }}>
-                      {guestName(b.guestId)} · staying {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)}
-                    </div>
-                  )}
-                </div>
-                <button onClick={() => onMarkCleanedToday(r.number)} style={primaryBtn}>
-                  Mark cleaned today
-                </button>
-              </div>
+              <button key={f.key} className="gx-btn" onClick={() => setFloor(f.key)} style={{ ...ghostBtn, minHeight: 40, whiteSpace: "nowrap", flexShrink: 0, background: act ? TOKENS.ink : "#fff", color: act ? TOKENS.paper : TOKENS.inkSoft, borderColor: act ? TOKENS.ink : TOKENS.paperDim, fontWeight: act ? 600 : 400 }}>
+                {f.label}
+              </button>
             );
           })}
         </div>
-      )}
-
-      <div style={{ fontSize: "0.75rem", color: TOKENS.dirty, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
-        Vacant rooms waiting on cleaning
       </div>
-      {needsCleaning.length === 0 ? (
-        <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem", marginBottom: "1.5rem" }}>All vacant rooms are clean.</div>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: "1.5rem" }}>
-          {needsCleaning.map((r) => (
-            <div key={r.number} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div>
-                <div style={{ fontWeight: 600 }}>
-                  Room {r.number} <span style={{ fontWeight: 400, color: TOKENS.inkSoft }}>· {r.type}</span>
-                </div>
-                <Pill status="vacant_dirty" />
-              </div>
-              <button onClick={() => onMarkClean(r.number)} style={primaryBtn}>
-                Mark clean
-              </button>
+
+      {view === "occupied" && (
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+            <div style={{ flex: 1, height: 8, background: TOKENS.paperDim, borderRadius: 999, overflow: "hidden" }} role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100}>
+              <div style={{ width: `${pct}%`, height: "100%", background: TOKENS.clean, borderRadius: 999, transition: "width .5s ease" }} />
             </div>
-          ))}
-        </div>
-      )}
-
-      {needsMaintenance.length > 0 && (
-        <>
-          <div style={{ fontSize: "0.75rem", color: TOKENS.oos, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
-            Due for a maintenance check
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: "1.5rem" }}>
-            {needsMaintenance.map((r) => (
-              <div key={r.number} style={{ ...cardStyle, border: `1px solid ${TOKENS.oos}`, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-                <div>
-                  <div style={{ fontWeight: 600 }}>
-                    Room {r.number} <span style={{ fontWeight: 400, color: TOKENS.inkSoft }}>· {r.type}</span>
-                  </div>
-                  <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft }}>
-                    {(checkoutCounts[r.number] || 0) - (r.maintenanceBaseline || 0)} checkouts since last check
-                  </div>
-                </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span
-                    style={{
-                      fontSize: "0.72rem",
-                      fontWeight: 500,
-                      color: TOKENS.oos,
-                      background: TOKENS.oosBg,
-                      borderRadius: 20,
-                      padding: "3px 10px",
-                    }}
-                  >
-                    Maintenance due
-                  </span>
-                  <button onClick={() => onPostponeMaintenance(r.number)} style={ghostBtn}>
-                    Postpone
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </>
-      )}
-
-      {outOfOrder.length > 0 && (
-        <>
-          <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
-            Out of order
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {outOfOrder.map((r) => (
-              <div key={r.number} style={cardStyle}>
-                <div style={{ fontWeight: 600 }}>
-                  Room {r.number} <span style={{ fontWeight: 400, color: TOKENS.inkSoft }}>· {r.type}</span>
-                </div>
-                <Pill status="out_of_order" />
-              </div>
-            ))}
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
-function TicketsTab({ tickets, onAddTicket }) {
-  const [form, setForm] = useState({ persons: 1, amountPaid: "", date: todayISO(), notes: "" });
-  const [formError, setFormError] = useState("");
-
-  const submit = () => {
-    setFormError("");
-    if (!form.persons || Number(form.persons) < 1) {
-      setFormError("Enter how many persons the ticket covers.");
-      return;
-    }
-    if (form.amountPaid === "" || Number(form.amountPaid) < 0) {
-      setFormError("Enter the amount paid.");
-      return;
-    }
-    onAddTicket({ persons: form.persons, amountPaid: form.amountPaid, date: form.date, notes: form.notes });
-    setForm({ persons: 1, amountPaid: "", date: todayISO(), notes: "" });
-  };
-
-  const today = todayISO();
-  const todaysTickets = tickets.filter((t) => t.date === today);
-  const todaysPersons = todaysTickets.reduce((s, t) => s + t.persons, 0);
-  const todaysRevenue = todaysTickets.reduce((s, t) => s + t.amountPaid, 0);
-
-  const [recentStart, setRecentStart] = useState(todayISO());
-  const [recentEnd, setRecentEnd] = useState(todayISO());
-  const recentEndExclusive = addDaysISO(recentEnd, 1);
-  const recentTickets = [...tickets]
-    .filter((t) => t.date >= recentStart && t.date < recentEndExclusive)
-    .sort((a, b) => b.date.localeCompare(a.date));
-
-  return (
-    <div>
-      <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", marginBottom: "0.5rem" }}>Tickets</h2>
-      <div style={{ fontSize: "0.85rem", color: TOKENS.inkSoft, marginBottom: "1rem" }}>
-        Log walk-in / day tickets — how many people came in and how much they paid.
-      </div>
-
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "0.75rem", marginBottom: "1.5rem" }}>
-        {[
-          { label: "Tickets today", value: todaysTickets.length },
-          { label: "Persons today", value: todaysPersons },
-          { label: "Revenue today", value: fmtMoney(todaysRevenue) },
-        ].map((c) => (
-          <div key={c.label} style={{ background: "#fff", border: `1px solid ${TOKENS.paperDim}`, borderRadius: 10, padding: "0.9rem" }}>
-            <div style={{ fontSize: "1.2rem", fontWeight: 600, fontFamily: "Fraunces, serif" }}>{c.value}</div>
-            <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>{c.label}</div>
-          </div>
-        ))}
-      </div>
-
-      <div style={cardStyle}>
-        <div style={{ fontWeight: 600, marginBottom: 10 }}>New ticket</div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0.75rem", marginBottom: "0.75rem" }}>
-          <div>
-            <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Persons</div>
-            <input
-              type="number"
-              min="1"
-              value={form.persons}
-              onChange={(e) => setForm({ ...form, persons: e.target.value })}
-              style={{ ...inputStyle, width: "100%" }}
-            />
-          </div>
-          <div>
-            <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Amount paid (EGP)</div>
-            <input
-              type="number"
-              min="0"
-              value={form.amountPaid}
-              onChange={(e) => setForm({ ...form, amountPaid: e.target.value })}
-              style={{ ...inputStyle, width: "100%" }}
-            />
-          </div>
-          <div>
-            <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Date</div>
-            <input
-              type="date"
-              value={form.date}
-              onChange={(e) => setForm({ ...form, date: e.target.value })}
-              style={{ ...inputStyle, width: "100%" }}
-            />
-          </div>
-          <div>
-            <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Notes (optional)</div>
-            <input
-              value={form.notes}
-              onChange={(e) => setForm({ ...form, notes: e.target.value })}
-              style={{ ...inputStyle, width: "100%" }}
-            />
-          </div>
-        </div>
-        {formError && (
-          <div style={{ fontSize: "0.8rem", color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginBottom: 8 }}>
-            {formError}
-          </div>
-        )}
-        <button onClick={submit} style={primaryBtn}>
-          Add ticket
-        </button>
-      </div>
-
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", margin: "1.25rem 0 8px", flexWrap: "wrap", gap: 8 }}>
-        <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>
-          Recent tickets
-        </div>
-        <div style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
-          <div>
-            <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>From</div>
-            <input type="date" value={recentStart} onChange={(e) => setRecentStart(e.target.value)} style={inputStyle} />
-          </div>
-          <div>
-            <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>To</div>
-            <input type="date" value={recentEnd} onChange={(e) => setRecentEnd(e.target.value)} style={inputStyle} />
-          </div>
-          <button
-            onClick={() => {
-              setRecentStart(todayISO());
-              setRecentEnd(todayISO());
-            }}
-            style={ghostBtn}
-          >
-            Today
-          </button>
-        </div>
-      </div>
-      {recentTickets.length === 0 ? (
-        <div style={{ color: TOKENS.inkSoft, fontSize: "0.9rem" }}>No tickets logged in this range.</div>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {recentTickets.map((t) => (
-            <div key={t.id} style={{ ...cardStyle, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-              <div>
-                <div style={{ fontWeight: 600 }}>
-                  {t.persons} {t.persons === 1 ? "person" : "persons"} · {fmtMoney(t.amountPaid)}
-                </div>
-                <div style={{ fontSize: "0.78rem", color: TOKENS.inkSoft }}>
-                  {fmtDate(t.date)}
-                  {t.notes ? ` · ${t.notes}` : ""}
-                </div>
-              </div>
+            <div style={{ fontSize: "0.74rem", color: TOKENS.inkSoft, whiteSpace: "nowrap" }}>
+              {doneToday}/{totalOccupied} cleaned · <strong style={{ color: TOKENS.ink }}>{pct}%</strong>
             </div>
-          ))}
+          </div>
+          {occDue.length === 0 && occDone.length === 0 ? (
+            <EmptyState icon="bed" title="No occupied rooms here" text={needle || floor !== "all" ? "Nothing matches this floor / search." : "There are no occupied rooms right now."} />
+          ) : (
+            <>
+              {occDue.length === 0 ? (
+                <EmptyState icon="check" title="All done for today" text="Every occupied room has been serviced." />
+              ) : (
+                <div className="hk-grid">{occDue.map(renderOccupiedCard)}</div>
+              )}
+              {occDone.length > 0 && (
+                <div style={{ marginTop: 20 }}>
+                  {sectionLabel(`Cleaned today (${occDone.length})`, TOKENS.clean)}
+                  <div className="hk-grid">{occDone.map(renderOccupiedCard)}</div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {view === "checkout" && (
+        <div>
+          {outPending.length === 0 && outFlashed.length === 0 ? (
+            <EmptyState icon="sparkles" title="No turnover cleaning waiting" text="All vacant rooms are clean." />
+          ) : (
+            <div className="hk-grid">
+              {outPending.map((r) => renderCheckoutCard(r, false))}
+              {outFlashed.map((r) => renderCheckoutCard(r, true))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {view === "maintenance" && (
+        <div>
+          {maintDue.length === 0 && maintFlashed.length === 0 && outOfOrder.length === 0 ? (
+            <EmptyState icon="wrench" title="No maintenance needed" text="No room is due for a check and none is out of order." />
+          ) : (
+            <>
+              {(maintDue.length > 0 || maintFlashed.length > 0) && (
+                <>
+                  {sectionLabel("Due for a maintenance check", TOKENS.oos)}
+                  <div className="hk-grid" style={{ marginBottom: 20 }}>
+                    {maintDue.map((r) => renderMaintCard(r, false))}
+                    {maintFlashed.map((r) => renderMaintCard(r, true))}
+                  </div>
+                </>
+              )}
+              {outOfOrder.length > 0 && (
+                <>
+                  {sectionLabel(`Out of order (${outOfOrder.length})`, TOKENS.brassDark)}
+                  <div className="hk-grid">
+                    {outOfOrder.map((r) => (
+                      <div key={r.number} className="hk-card" style={cardBase(false, TOKENS.brassDark)}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                          <div style={roomNumberStyle}>{r.number}</div>
+                          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            <SoftBadge color={TOKENS.oos} bg={TOKENS.oosBg} icon="ban">
+                              Out of order
+                            </SoftBadge>
+                            {typeChip(r)}
+                          </div>
+                        </div>
+                        <div style={infoLine}>Open the room in the Rooms tab to put it back in service.</div>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </>
+          )}
         </div>
       )}
     </div>
   );
 }
-
-const ROOM_FILTERS = [
-  { key: "active", label: "Active only" },
-  { key: "all", label: "All rooms" },
-  { key: "reservations", label: "Reservations" },
-  { key: "checkins", label: "Check-in" },
-  { key: "checkouts", label: "Check-out" },
-  { key: "occupied", label: "Occupied" },
-  { key: "maintenance", label: "Maintenance" },
-  { key: "revenue", label: "Revenue" },
-];
 
 function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRates, mealPlanRates, tickets, accessToken, hotelId, onDeleteTicket, guestName, onDeleteBooking }) {
   const [rangeStart, setRangeStart] = useState(startOfMonthISO());
@@ -4693,9 +6114,271 @@ function SimpleChart({ series, type }) {
   );
 }
 
-function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates, accessToken, hotelId, guestName }) {
+// ───────────────────────── Today report (daily shift dashboard) ─────────────────────────
+
+const TODAY_CSS = `
+.td-kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+@media (max-width: 1023px) { .td-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 639px) { .td-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } .td-kpis > :last-child { grid-column: 1 / -1; } }
+.td-kpi { border: 1px solid rgba(255,255,255,.9); background: rgba(255,255,255,.65); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border-radius: 14px; padding: .7rem .8rem; display: flex; align-items: center; gap: 10px; box-shadow: 0 2px 10px rgba(27,36,48,.05); }
+.td-meals { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 899px) { .td-meals { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 379px) { .td-meals { grid-template-columns: minmax(0, 1fr); } }
+.td-move { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.td-full { width: 100%; box-sizing: border-box; }
+@media (max-width: 639px) { .td-datebar input, .td-range input { flex: 1; width: 100%; } }
+`;
+
+const MEAL_COVERAGE = {
+  breakfast: ["B.B", "HB", "FB", "All-inclusive"],
+  lunch: ["FB", "All-inclusive"],
+  dinner: ["HB", "FB", "All-inclusive"],
+};
+const ROOM_STATUS_SHORT = { vacant_clean: "Clean", vacant_dirty: "Dirty", occupied: "Occupied", out_of_order: "Out of order" };
+const TREND_COLORS = { checkins: "#4A7C59", checkouts: "#D98B3A", occupied: "#3B6FA0", revenue: "#B08968" };
+
+function niceCeil(v) {
+  if (v <= 4) return 4;
+  const pow = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / pow;
+  const step = n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10;
+  return step * pow;
+}
+function compactNum(v) {
+  if (Math.abs(v) >= 1000000) return `${Math.round(v / 100000) / 10}M`;
+  if (Math.abs(v) >= 1000) return `${Math.round(v / 100) / 10}k`;
+  return String(Math.round(v * 10) / 10);
+}
+
+function TrendChart({ series, type, color, isMoney }) {
+  const ref = useRef(null);
+  const [w, setW] = useState(600);
+  const [active, setActive] = useState(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return undefined;
+    const measure = () => setW(Math.max(260, el.clientWidth));
+    measure();
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(measure);
+      ro.observe(el);
+      return () => ro.disconnect();
+    }
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, []);
+
+  const h = 240;
+  const pad = { top: 14, right: 12, bottom: 28, left: isMoney ? 46 : 32 };
+  const innerW = w - pad.left - pad.right;
+  const innerH = h - pad.top - pad.bottom;
+  const n = series.length;
+  const maxVal = niceCeil(Math.max(1, ...series.map((p) => p.value)));
+  const slot = n > 0 ? innerW / n : innerW;
+  const xBar = (i) => pad.left + slot * i + slot / 2;
+  const xLine = (i) => pad.left + (n > 1 ? (innerW * i) / (n - 1) : innerW / 2);
+  const xFor = type === "bar" ? xBar : xLine;
+  const yFor = (v) => pad.top + innerH - (v / maxVal) * innerH;
+  const ticks = [0, 1, 2, 3, 4].map((t) => (maxVal * t) / 4);
+  const labelEvery = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(innerW / 56))));
+  const barW = Math.max(3, Math.min(30, slot * 0.62));
+
+  const pickIndex = (e) => {
+    const rect = ref.current.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    let i;
+    if (type === "bar") i = Math.floor((x - pad.left) / slot);
+    else i = n > 1 ? Math.round(((x - pad.left) / innerW) * (n - 1)) : 0;
+    setActive(Math.max(0, Math.min(n - 1, i)));
+  };
+
+  const fmtVal = (v) => (isMoney ? fmtMoney(v) : String(v));
+  const linePath = series.map((p, i) => `${i === 0 ? "M" : "L"}${xLine(i)},${yFor(p.value)}`).join(" ");
+  const areaPath = n > 0 ? `${linePath} L${xLine(n - 1)},${yFor(0)} L${xLine(0)},${yFor(0)} Z` : "";
+  const gid = `tg${color.replace("#", "")}`;
+  const act = active !== null && series[active] ? series[active] : null;
+  const tipLeft = act ? Math.max(60, Math.min(w - 60, xFor(active))) : 0;
+
+  if (n === 0) return <div style={{ color: TOKENS.inkSoft, fontSize: "0.85rem", padding: "1.5rem 0", textAlign: "center" }}>Pick a valid date range.</div>;
+
+  return (
+    <div ref={ref} style={{ position: "relative", width: "100%" }}>
+      <svg
+        width={w}
+        height={h}
+        style={{ display: "block", touchAction: "pan-y", cursor: "crosshair" }}
+        onPointerMove={pickIndex}
+        onPointerDown={pickIndex}
+        onPointerLeave={(e) => e.pointerType === "mouse" && setActive(null)}
+        role="img"
+        aria-label="Trend chart"
+      >
+        <defs>
+          <linearGradient id={gid} x1="0" x2="0" y1="0" y2="1">
+            <stop offset="0%" stopColor={color} stopOpacity="0.35" />
+            <stop offset="100%" stopColor={color} stopOpacity="0.02" />
+          </linearGradient>
+        </defs>
+        {ticks.map((t) => (
+          <g key={t}>
+            <line x1={pad.left} x2={w - pad.right} y1={yFor(t)} y2={yFor(t)} stroke={TOKENS.paperDim} strokeDasharray={t === 0 ? undefined : "3 4"} />
+            <text x={pad.left - 6} y={yFor(t) + 4} textAnchor="end" fontSize="10" fill={TOKENS.inkSoft}>
+              {compactNum(t)}
+            </text>
+          </g>
+        ))}
+        {type === "bar" &&
+          series.map((p, i) => (
+            <rect key={p.label} x={xBar(i) - barW / 2} y={yFor(p.value)} width={barW} height={Math.max(0, yFor(0) - yFor(p.value))} rx={Math.min(5, barW / 2)} fill={color} opacity={active === null || active === i ? 1 : 0.45} />
+          ))}
+        {type !== "bar" && (
+          <>
+            {type === "area" && <path d={areaPath} fill={`url(#${gid})`} />}
+            <path d={linePath} fill="none" stroke={color} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+            {n <= 31 && series.map((p, i) => <circle key={p.label} cx={xLine(i)} cy={yFor(p.value)} r={active === i ? 5 : 2.8} fill="#fff" stroke={color} strokeWidth="2" />)}
+          </>
+        )}
+        {act && <line x1={xFor(active)} x2={xFor(active)} y1={pad.top} y2={yFor(0)} stroke={color} strokeOpacity="0.35" strokeDasharray="3 3" />}
+        {series.map((p, i) =>
+          i % labelEvery === 0 ? (
+            <text key={p.label} x={xFor(i)} y={h - 8} textAnchor="middle" fontSize="10" fill={TOKENS.inkSoft}>
+              {fmtDate(p.label)}
+            </text>
+          ) : null
+        )}
+      </svg>
+      {act && (
+        <div style={{ position: "absolute", top: 0, left: tipLeft, transform: "translateX(-50%)", background: "rgba(27,36,48,.92)", color: TOKENS.paper, borderRadius: 8, padding: "4px 9px", fontSize: "0.72rem", pointerEvents: "none", whiteSpace: "nowrap", boxShadow: "0 4px 12px rgba(0,0,0,.2)" }}>
+          <span style={{ opacity: 0.75 }}>{fmtDateY(act.label)}</span> · <strong>{fmtVal(act.value)}</strong>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MovementList({ kind, rows, loading, mobile, rooms, guestName, isToday, onCheckIn, onAskCheckOut }) {
+  const roomStatusBadge = (b) => {
+    const r = rooms.find((x) => x.number === b.roomNumber);
+    if (!r) return <span style={{ color: TOKENS.inkSoft }}>—</span>;
+    const m = STATUS_META[r.status];
+    return (
+      <SoftBadge small color={m.color} bg={m.bg}>
+        {ROOM_STATUS_SHORT[r.status] || m.label}
+      </SoftBadge>
+    );
+  };
+  const mealBadge = (b) => {
+    const plan = b.mealPlans && b.mealPlans[0];
+    return (
+      <SoftBadge small color="#2F5F8F" bg="#DCE9F5">
+        {plan || "Room only"}
+      </SoftBadge>
+    );
+  };
+  const action = (b, stretch) => {
+    const st = stretch ? { flex: 1, justifyContent: "center", padding: "0.55rem 0.5rem" } : {};
+    const base = { display: "inline-flex", alignItems: "center", gap: 5, whiteSpace: "nowrap", fontSize: "0.78rem", ...st };
+    if (b.status === "checked_out") return <SoftBadge small color={TOKENS.occupied} bg={TOKENS.occupiedBg}>Checked out</SoftBadge>;
+    if (kind === "in") {
+      if (b.status === "checked_in") return <SoftBadge small color={TOKENS.clean} bg={TOKENS.cleanBg}>Checked in</SoftBadge>;
+      if (!b.roomNumber) return <SoftBadge small color={TOKENS.dirty} bg={TOKENS.dirtyBg}>No room yet</SoftBadge>;
+      if (!isToday || !onCheckIn) return <SoftBadge small color={TOKENS.reserved} bg={TOKENS.reservedBg}>Reserved</SoftBadge>;
+      return (
+        <button className="gx-btn" onClick={() => onCheckIn(b.id)} style={{ ...primaryBtn, ...base, background: TOKENS.clean }}>
+          <Ico name="login" size={13} /> Check in
+        </button>
+      );
+    }
+    if (b.status === "checked_in") {
+      if (!isToday || !onAskCheckOut) return <SoftBadge small color={TOKENS.clean} bg={TOKENS.cleanBg}>In-House</SoftBadge>;
+      return (
+        <button className="gx-btn" onClick={() => onAskCheckOut(b)} style={{ ...primaryBtn, ...base, background: "#C9722B" }}>
+          <Ico name="logout" size={13} /> Check out
+        </button>
+      );
+    }
+    return <SoftBadge small color={TOKENS.dirty} bg={TOKENS.dirtyBg}>Not checked in</SoftBadge>;
+  };
+
+  if (loading) return <BookingsSkeleton mobile={mobile} />;
+  if (rows.length === 0) {
+    return (
+      <div style={{ textAlign: "center", padding: "1.6rem 1rem", color: TOKENS.inkSoft }}>
+        <div style={{ display: "inline-flex", padding: 12, borderRadius: "50%", background: TOKENS.paper, marginBottom: 8 }}>
+          <Ico name={kind === "in" ? "login" : "logout"} size={22} color={TOKENS.brass} />
+        </div>
+        <div style={{ fontSize: "0.85rem" }}>No {kind === "in" ? "check-ins" : "check-outs"} on this day.</div>
+      </div>
+    );
+  }
+
+  if (mobile) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {rows.map((b) => (
+          <div key={b.id} style={{ border: `1px solid ${TOKENS.paperDim}`, borderRadius: 12, padding: "0.75rem", background: "#fff" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontWeight: 700, fontSize: "1.02rem" }}>{roomLabel(b.roomNumber)}</div>
+                <div style={{ fontWeight: 600, fontSize: "0.9rem", wordBreak: "break-word" }}>{guestName(b.guestId)}</div>
+              </div>
+              {roomStatusBadge(b)}
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", margin: "8px 0" }}>
+              {mealBadge(b)}
+              {b.paymentMethod && (
+                <span style={{ fontSize: "0.66rem", color: TOKENS.inkSoft, border: `1px solid ${TOKENS.paperDim}`, borderRadius: 999, padding: "2px 7px" }}>{paymentMethodLabel(b.paymentMethod)}</span>
+              )}
+              <span style={{ marginLeft: "auto", fontSize: "0.82rem", fontWeight: 700 }}>{Number(b.totalAmount) > 0 ? fmtMoney(Number(b.totalAmount)) : "—"}</span>
+            </div>
+            <div style={{ display: "flex" }}>{action(b, true)}</div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  const th = { textAlign: "left", fontSize: "0.68rem", fontWeight: 600, color: TOKENS.inkSoft, padding: "0.5rem 0.55rem", whiteSpace: "nowrap" };
+  const td = { padding: "0.55rem", fontSize: "0.8rem", verticalAlign: "middle", borderTop: `1px solid ${TOKENS.paperDim}` };
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <thead>
+          <tr>
+            <th style={th}>Room</th>
+            <th style={th}>Guest</th>
+            <th style={th}>Meal</th>
+            <th style={th}>Total</th>
+            <th style={th}>Room</th>
+            <th style={{ ...th, textAlign: "right" }}></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((b) => (
+            <tr key={b.id}>
+              <td style={{ ...td, fontWeight: 700, whiteSpace: "nowrap" }}>{b.roomNumber || "—"}</td>
+              <td style={{ ...td, maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={guestName(b.guestId)}>
+                {guestName(b.guestId)}
+              </td>
+              <td style={td}>{mealBadge(b)}</td>
+              <td style={{ ...td, whiteSpace: "nowrap" }}>{Number(b.totalAmount) > 0 ? fmtMoney(Number(b.totalAmount)) : "—"}</td>
+              <td style={td}>{roomStatusBadge(b)}</td>
+              <td style={{ ...td, textAlign: "right" }}>{action(b, false)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates, accessToken, hotelId, guestName, onCheckIn, onCheckOut }) {
+  const mobile = useIsMobile();
   const [reportDate, setReportDate] = useState(todayISO());
   const isToday = reportDate === todayISO();
+  const [moveTab, setMoveTab] = useState("in");
+  const [confirmOut, setConfirmOut] = useState(null);
 
   const roomNumberById = useMemo(() => {
     const map = {};
@@ -4720,12 +6403,12 @@ function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates, accessToken
       setCheckInRooms(
         (bookings || [])
           .filter((b) => b.status !== "cancelled" && b.checkIn === reportDate)
-          .sort((a, b) => a.roomNumber.localeCompare(b.roomNumber))
+          .sort((a, b) => (a.roomNumber || "").localeCompare(b.roomNumber || ""))
       );
       setCheckOutRooms(
         (bookings || [])
           .filter((b) => b.status !== "cancelled" && b.checkOut === reportDate)
-          .sort((a, b) => a.roomNumber.localeCompare(b.roomNumber))
+          .sort((a, b) => (a.roomNumber || "").localeCompare(b.roomNumber || ""))
       );
       setLoadingLists(false);
       return;
@@ -4739,8 +6422,8 @@ function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates, accessToken
     ])
       .then(([ins, outs]) => {
         if (cancelled) return;
-        setCheckInRooms(ins.sort((a, b) => a.roomNumber.localeCompare(b.roomNumber)));
-        setCheckOutRooms(outs.sort((a, b) => a.roomNumber.localeCompare(b.roomNumber)));
+        setCheckInRooms(ins.sort((a, b) => (a.roomNumber || "").localeCompare(b.roomNumber || "")));
+        setCheckOutRooms(outs.sort((a, b) => (a.roomNumber || "").localeCompare(b.roomNumber || "")));
       })
       .catch(() => {
         if (!cancelled) setListError("Couldn't load check-in/check-out rooms for this date — check your connection and try again.");
@@ -4756,28 +6439,37 @@ function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates, accessToken
   const roomsReadyForCheckIn = isToday ? rooms.filter((r) => r.status === "vacant_clean").length : null;
   const checkInsToday = bookings.filter((b) => b.status !== "cancelled" && b.checkIn === reportDate).length;
   const checkOutsToday = bookings.filter((b) => b.status !== "cancelled" && b.checkOut === reportDate).length;
-  const occupiedToday = new Set(
-    bookings
-      .filter((b) => (b.status === "checked_in" || b.status === "checked_out") && b.checkIn <= reportDate && reportDate < b.checkOut)
-      .map((b) => b.roomNumber)
-  ).size;
+  const stayedToday = bookings.filter((b) => (b.status === "checked_in" || b.status === "checked_out") && b.checkIn <= reportDate && reportDate < b.checkOut);
+  const occupiedToday = new Set(stayedToday.map((b) => b.roomNumber)).size;
+  const inHouseGuests = stayedToday.reduce((sum, b) => sum + (b.persons || 1), 0);
 
-  const mealPlanCounts = useMemo(() => {
-    const counts = {};
-    GUEST_MEAL_PLAN_CHOICES.forEach((p) => (counts[p] = 0));
+  // Kitchen headcount = number of PEOPLE (persons on each booking), not rooms.
+  const kitchen = useMemo(() => {
+    const perPlan = {};
+    GUEST_MEAL_PLAN_CHOICES.forEach((p) => (perPlan[p] = 0));
+    let none = 0;
     bookings
       .filter((b) => b.status !== "cancelled" && b.checkIn <= reportDate && reportDate < b.checkOut)
       .forEach((b) => {
+        const people = b.persons || 1;
         const plan = b.mealPlans && b.mealPlans[0];
-        if (plan && counts[plan] !== undefined) counts[plan] += 1;
+        if (plan && perPlan[plan] !== undefined) perPlan[plan] += people;
+        else none += people;
       });
-    return counts;
+    const sum = (plans) => plans.reduce((t, p) => t + (perPlan[p] || 0), 0);
+    return {
+      perPlan,
+      breakfast: sum(MEAL_COVERAGE.breakfast),
+      lunch: sum(MEAL_COVERAGE.lunch),
+      dinner: sum(MEAL_COVERAGE.dinner),
+      roomOnly: (perPlan["B.O"] || 0) + none,
+    };
   }, [bookings, reportDate]);
 
   const [chartStart, setChartStart] = useState(addDaysISO(todayISO(), -6));
   const [chartEnd, setChartEnd] = useState(todayISO());
   const [chartMetric, setChartMetric] = useState("checkins");
-  const [chartType, setChartType] = useState("bar");
+  const [chartType, setChartType] = useState("area");
 
   const chartSeries = useMemo(() => {
     const days = isoDateRange(chartStart, chartEnd);
@@ -4817,124 +6509,237 @@ function TodayReportTab({ rooms, bookings, roomRates, mealPlanRates, accessToken
     });
   }, [bookings, rooms, roomRates, mealPlanRates, chartStart, chartEnd, chartMetric]);
 
+  const chartTotal = chartSeries.reduce((t, p) => t + p.value, 0);
+  const chartAvg = chartSeries.length ? chartTotal / chartSeries.length : 0;
+  const chartPeak = chartSeries.reduce((best, p) => (p.value > (best ? best.value : -1) ? p : best), null);
+  const isMoney = chartMetric === "revenue";
+  const showVal = (v) => (isMoney ? fmtMoney(Math.round(v)) : String(Math.round(v * 10) / 10));
+  const setPreset = (days) => {
+    setChartEnd(todayISO());
+    setChartStart(addDaysISO(todayISO(), -(days - 1)));
+  };
+
+  const kpis = [
+    { label: "Occupied rooms", value: occupiedToday, icon: "bed", color: "#3B6FA0", bg: "#DCE9F5" },
+    { label: "In-house guests", value: inHouseGuests, icon: "users", color: "#3B6FA0", bg: "#DCE9F5" },
+    { label: isToday ? "Ready for check-in" : "Ready (today only)", value: isToday ? roomsReadyForCheckIn : "—", icon: "check", color: TOKENS.clean, bg: TOKENS.cleanBg },
+    { label: isToday ? "Today's arrivals" : "Arrivals", value: checkInsToday, icon: "login", color: TOKENS.clean, bg: TOKENS.cleanBg },
+    { label: isToday ? "Today's departures" : "Departures", value: checkOutsToday, icon: "logout", color: "#C9722B", bg: "#FBE7D2" },
+  ];
+
+  const meals = [
+    { key: "breakfast", label: "Breakfast", emoji: "🥐", n: kitchen.breakfast, plans: MEAL_COVERAGE.breakfast },
+    { key: "lunch", label: "Lunch", emoji: "🥗", n: kitchen.lunch, plans: MEAL_COVERAGE.lunch },
+    { key: "dinner", label: "Dinner", emoji: "🍽️", n: kitchen.dinner, plans: MEAL_COVERAGE.dinner },
+    { key: "roomOnly", label: "Room only", emoji: "🛏️", n: kitchen.roomOnly, plans: ["B.O"], extra: "no plan" },
+  ];
+
+  const sectionTitle = { fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 };
+  const glassCard = { background: "rgba(255,255,255,.75)", backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)", border: "1px solid rgba(255,255,255,.9)", borderRadius: 16, padding: "0.9rem", boxShadow: "0 2px 12px rgba(27,36,48,.06)" };
+  const dayWord = isToday ? "today" : "on this day";
+
+  const listProps = { rooms, guestName, isToday, onCheckIn, onAskCheckOut: onCheckOut ? setConfirmOut : undefined, loading: loadingLists, mobile };
+
   return (
     <div>
-      <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", marginBottom: "1rem" }}>Today report</h2>
+      <style>{GUESTS_CSS}</style>
+      <style>{TODAY_CSS}</style>
 
-      <div style={{ marginBottom: "1.25rem" }}>
-        <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Report date</div>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <input type="date" value={reportDate} onChange={(e) => setReportDate(e.target.value)} style={inputStyle} />
-          {!isToday && (
-            <button onClick={() => setReportDate(todayISO())} style={ghostBtn}>
-              Today
+      <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", margin: "0 0 0.75rem" }}>Today report</h2>
+
+      <div className="td-datebar" style={{ display: "flex", gap: 8, alignItems: "flex-end", marginBottom: "1rem", flexWrap: "wrap" }}>
+        <div style={{ flex: mobile ? "1 1 100%" : "0 0 auto" }}>
+          <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Report date</div>
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <button className="gx-btn" onClick={() => setReportDate(addDaysISO(reportDate, -1))} style={{ ...ghostBtn, padding: "0.5rem 0.6rem", display: "inline-flex", background: "#fff" }} aria-label="Previous day">
+              <Ico name="left" size={15} />
             </button>
-          )}
+            <input type="date" value={reportDate} onChange={(e) => e.target.value && setReportDate(e.target.value)} style={{ ...inputStyle, flex: mobile ? 1 : undefined }} />
+            <button className="gx-btn" onClick={() => setReportDate(addDaysISO(reportDate, 1))} style={{ ...ghostBtn, padding: "0.5rem 0.6rem", display: "inline-flex", background: "#fff" }} aria-label="Next day">
+              <Ico name="right" size={15} />
+            </button>
+            {!isToday && (
+              <button className="gx-btn" onClick={() => setReportDate(todayISO())} style={ghostBtn}>
+                Today
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: "0.75rem", marginBottom: "1.75rem" }}>
-        {[
-          { label: isToday ? "Rooms ready for check-in" : "Rooms ready for check-in (today only)", value: isToday ? roomsReadyForCheckIn : "—" },
-          { label: isToday ? "Check-ins today" : "Check-ins on this day", value: checkInsToday },
-          { label: isToday ? "Check-outs today" : "Check-outs on this day", value: checkOutsToday },
-          { label: isToday ? "Occupied rooms today" : "Occupied rooms on this day", value: occupiedToday },
-        ].map((c) => (
-          <div key={c.label} style={{ background: "#fff", border: `1px solid ${TOKENS.paperDim}`, borderRadius: 10, padding: "0.9rem" }}>
-            <div style={{ fontSize: "1.5rem", fontWeight: 600, fontFamily: "Fraunces, serif" }}>{c.value}</div>
-            <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>{c.label}</div>
+      {/* KPI bar */}
+      <div style={{ background: "linear-gradient(135deg, rgba(176,137,104,.22), rgba(68,85,105,.12))", borderRadius: 18, padding: 10, marginBottom: "1.5rem" }}>
+        <div className="td-kpis">
+          {kpis.map((k) => (
+            <div key={k.label} className="td-kpi">
+              <span style={{ width: 36, height: 36, borderRadius: 11, background: k.bg, color: k.color, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                <Ico name={k.icon} size={18} />
+              </span>
+              <span style={{ minWidth: 0 }}>
+                <span style={{ display: "block", fontSize: "1.45rem", fontWeight: 700, fontFamily: "Fraunces, serif", lineHeight: 1.1 }}>{k.value}</span>
+                <span style={{ display: "block", fontSize: "0.7rem", color: TOKENS.inkSoft, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{k.label}</span>
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {listError && <div style={{ color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.75rem", fontSize: "0.85rem", marginBottom: "0.75rem" }}>{listError}</div>}
+
+      {/* Kitchen & dining */}
+      <div style={sectionTitle}>Kitchen &amp; dining — headcount {dayWord}</div>
+      <div className="td-meals" style={{ marginBottom: "1.75rem" }}>
+        {meals.map((m) => (
+          <div key={m.key} style={glassCard}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ width: 42, height: 42, borderRadius: 13, background: "#DCE9F5", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: "1.35rem", flexShrink: 0 }} aria-hidden="true">
+                {m.emoji}
+              </span>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: "1.6rem", fontWeight: 700, fontFamily: "Fraunces, serif", lineHeight: 1.05 }}>{m.n}</div>
+                <div style={{ fontSize: "0.74rem", color: TOKENS.inkSoft }}>{m.label} · guests</div>
+              </div>
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 10 }}>
+              {m.plans.map((p) => (
+                <SoftBadge key={p} small color="#2F5F8F" bg="#DCE9F5">
+                  {p} {kitchen.perPlan[p] || 0}
+                </SoftBadge>
+              ))}
+              {m.extra && (
+                <SoftBadge small color="#2F5F8F" bg="#DCE9F5">
+                  {m.extra}{" "}
+                  {kitchen.roomOnly - (kitchen.perPlan["B.O"] || 0)}
+                </SoftBadge>
+              )}
+            </div>
           </div>
         ))}
       </div>
 
-      {listError && <div style={{ color: TOKENS.oos, fontSize: "0.85rem", marginBottom: "0.75rem" }}>{listError}</div>}
-
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "1rem", marginBottom: "1.75rem" }}>
-        <div style={cardStyle}>
-          <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
-            Check-in rooms {isToday ? "today" : "on this day"}
+      {/* Movements */}
+      <div style={sectionTitle}>Today's movements</div>
+      {mobile ? (
+        <div style={{ marginBottom: "1.75rem" }}>
+          <div style={{ display: "flex", gap: 6, marginBottom: 10 }} role="tablist">
+            {[
+              { key: "in", label: "Check-ins", n: checkInRooms.length, color: TOKENS.clean, bg: TOKENS.cleanBg },
+              { key: "out", label: "Check-outs", n: checkOutRooms.length, color: "#C9722B", bg: "#FBE7D2" },
+            ].map((t) => {
+              const act = moveTab === t.key;
+              return (
+                <button
+                  key={t.key}
+                  role="tab"
+                  aria-selected={act}
+                  className="gx-btn"
+                  onClick={() => setMoveTab(t.key)}
+                  style={{ ...ghostBtn, flex: 1, padding: "0.65rem 0.5rem", display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6, background: act ? t.bg : "#fff", color: act ? t.color : TOKENS.inkSoft, borderColor: act ? t.color : TOKENS.paperDim, fontWeight: act ? 700 : 400 }}
+                >
+                  {t.label}
+                  <span style={{ fontSize: "0.68rem", borderRadius: 999, padding: "1px 7px", background: act ? "#fff" : TOKENS.paper }}>{t.n}</span>
+                </button>
+              );
+            })}
           </div>
-          {loadingLists ? (
-            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>Loading…</div>
-          ) : checkInRooms.length === 0 ? (
-            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>No check-ins on this day.</div>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {checkInRooms.map((b) => (
-                <div key={b.id} style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem", borderBottom: `1px solid ${TOKENS.paperDim}`, paddingBottom: 4 }}>
-                  <span style={{ fontWeight: 600 }}>{roomLabel(b.roomNumber)}</span>
-                  <span style={{ color: TOKENS.inkSoft }}>{guestName(b.guestId)}</span>
-                </div>
-              ))}
+          <MovementList kind={moveTab} rows={moveTab === "in" ? checkInRooms : checkOutRooms} {...listProps} />
+        </div>
+      ) : (
+        <div className="td-move" style={{ marginBottom: "1.75rem" }}>
+          {[
+            { kind: "in", title: `Check-ins ${dayWord}`, rows: checkInRooms, icon: "login", color: TOKENS.clean, bg: TOKENS.cleanBg },
+            { kind: "out", title: `Check-outs ${dayWord}`, rows: checkOutRooms, icon: "logout", color: "#C9722B", bg: "#FBE7D2" },
+          ].map((col) => (
+            <div key={col.kind} style={{ ...glassCard, padding: "0.8rem 0.9rem", minWidth: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                <span style={{ width: 28, height: 28, borderRadius: 9, background: col.bg, color: col.color, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>
+                  <Ico name={col.icon} size={15} />
+                </span>
+                <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>{col.title}</div>
+                <SoftBadge small color={col.color} bg={col.bg}>
+                  {col.rows.length}
+                </SoftBadge>
+              </div>
+              <MovementList kind={col.kind} rows={col.rows} {...listProps} />
             </div>
-          )}
+          ))}
         </div>
-        <div style={cardStyle}>
-          <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
-            Check-out rooms {isToday ? "today" : "on this day"}
-          </div>
-          {loadingLists ? (
-            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>Loading…</div>
-          ) : checkOutRooms.length === 0 ? (
-            <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem" }}>No check-outs on this day.</div>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {checkOutRooms.map((b) => (
-                <div key={b.id} style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem", borderBottom: `1px solid ${TOKENS.paperDim}`, paddingBottom: 4 }}>
-                  <span style={{ fontWeight: 600 }}>{roomLabel(b.roomNumber)}</span>
-                  <span style={{ color: TOKENS.inkSoft }}>{guestName(b.guestId)}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
+      )}
 
-      <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
-        Meal plan breakdown — guests on property {isToday ? "today" : "this day"}
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: "0.75rem", marginBottom: "1.75rem" }}>
-        {GUEST_MEAL_PLAN_CHOICES.map((plan) => (
-          <div key={plan} style={{ ...cardStyle, margin: 0, textAlign: "center" }}>
-            <div style={{ fontSize: "1.3rem", fontWeight: 600, fontFamily: "Fraunces, serif" }}>{mealPlanCounts[plan] || 0}</div>
-            <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>{plan}</div>
-          </div>
-        ))}
-      </div>
-
-      <div style={{ fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, fontWeight: 600 }}>
-        Trends
-      </div>
-      <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginBottom: "1rem", flexWrap: "wrap" }}>
-        <div>
-          <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>From</div>
-          <input type="date" value={chartStart} onChange={(e) => setChartStart(e.target.value)} style={inputStyle} />
-        </div>
-        <div>
-          <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>To</div>
-          <input type="date" value={chartEnd} onChange={(e) => setChartEnd(e.target.value)} style={inputStyle} />
-        </div>
-        <div>
-          <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Metric</div>
-          <select value={chartMetric} onChange={(e) => setChartMetric(e.target.value)} style={inputStyle}>
-            {CHART_METRICS.map((m) => (
-              <option key={m.key} value={m.key}>
+      {/* Trends */}
+      <div style={sectionTitle}>Trends &amp; analytics</div>
+      <div style={{ ...glassCard, marginBottom: "1rem" }}>
+        <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 6, marginBottom: 8 }} role="tablist">
+          {CHART_METRICS.map((m) => {
+            const act = chartMetric === m.key;
+            return (
+              <button
+                key={m.key}
+                role="tab"
+                aria-selected={act}
+                className="gx-btn"
+                onClick={() => setChartMetric(m.key)}
+                style={{ ...ghostBtn, whiteSpace: "nowrap", flexShrink: 0, background: act ? TREND_COLORS[m.key] : "#fff", color: act ? "#fff" : TOKENS.inkSoft, borderColor: act ? TREND_COLORS[m.key] : TOKENS.paperDim, fontWeight: act ? 600 : 400 }}
+              >
                 {m.label}
-              </option>
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="td-range" style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap", marginBottom: 10 }}>
+          <label style={{ flex: mobile ? "1 1 45%" : "0 0 auto", fontSize: "0.7rem", color: TOKENS.inkSoft }}>
+            <div style={{ marginBottom: 4 }}>From</div>
+            <input type="date" value={chartStart} onChange={(e) => setChartStart(e.target.value)} style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} />
+          </label>
+          <label style={{ flex: mobile ? "1 1 45%" : "0 0 auto", fontSize: "0.7rem", color: TOKENS.inkSoft }}>
+            <div style={{ marginBottom: 4 }}>To</div>
+            <input type="date" value={chartEnd} onChange={(e) => setChartEnd(e.target.value)} style={{ ...inputStyle, width: "100%", boxSizing: "border-box" }} />
+          </label>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", flex: mobile ? "1 1 100%" : "0 0 auto" }}>
+            {[7, 14, 30].map((d) => (
+              <button key={d} className="gx-btn" onClick={() => setPreset(d)} style={{ ...ghostBtn, background: "#fff", flex: mobile ? 1 : undefined }}>
+                {d}d
+              </button>
             ))}
-          </select>
+            <select value={chartType} onChange={(e) => setChartType(e.target.value)} style={{ ...inputStyle, flex: mobile ? 1 : undefined }} aria-label="Chart type">
+              <option value="area">Area</option>
+              <option value="line">Line</option>
+              <option value="bar">Bars</option>
+            </select>
+          </div>
         </div>
-        <div>
-          <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 }}>Chart type</div>
-          <select value={chartType} onChange={(e) => setChartType(e.target.value)} style={inputStyle}>
-            <option value="bar">Bar</option>
-            <option value="line">Line</option>
-          </select>
+
+        <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+          {[
+            { label: isMoney || chartMetric === "occupied" ? (chartMetric === "occupied" ? "Average / day" : "Total") : "Total", value: chartMetric === "occupied" ? showVal(chartAvg) : showVal(chartTotal) },
+            { label: chartMetric === "occupied" ? "Peak" : "Average / day", value: chartMetric === "occupied" ? showVal(chartPeak ? chartPeak.value : 0) : showVal(chartAvg) },
+            { label: "Peak day", value: chartPeak && chartPeak.value > 0 ? fmtDate(chartPeak.label) : "—" },
+          ].map((s) => (
+            <div key={s.label} style={{ flex: "1 1 90px", background: TOKENS.paper, borderRadius: 10, padding: "0.5rem 0.7rem" }}>
+              <div style={{ fontSize: "0.66rem", color: TOKENS.inkSoft }}>{s.label}</div>
+              <div style={{ fontWeight: 700, fontSize: "0.95rem" }}>{s.value}</div>
+            </div>
+          ))}
         </div>
+
+        <TrendChart series={chartSeries} type={chartType} color={TREND_COLORS[chartMetric]} isMoney={isMoney} />
+        <div style={{ fontSize: "0.68rem", color: TOKENS.inkSoft, marginTop: 6 }}>Tap or hover the chart to see exact values.</div>
       </div>
-      <div style={{ ...cardStyle, margin: 0 }}>
-        <SimpleChart series={chartSeries} type={chartType} />
-      </div>
+
+      {confirmOut && (
+        <ConfirmModal
+          title="Check out guest?"
+          message={`${guestName(confirmOut.guestId)} will be checked out of ${roomLabel(confirmOut.roomNumber)}. The room will be marked as needing cleaning.`}
+          confirmLabel="Check out"
+          cancelLabel="Not yet"
+          onConfirm={() => {
+            onCheckOut(confirmOut.id);
+            setConfirmOut(null);
+          }}
+          onClose={() => setConfirmOut(null)}
+        />
+      )}
     </div>
   );
 }
