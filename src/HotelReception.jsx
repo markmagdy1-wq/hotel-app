@@ -127,13 +127,37 @@ const FREE_MEAL_PLANS = ["B.B", "B.O"]; // always no charge, not editable in Roo
 const GUEST_MEAL_PLAN_CHOICES = [...MEAL_PLANS, ...FREE_MEAL_PLANS];
 const MAINTENANCE_THRESHOLD = 3;
 
-const BOOKING_TYPES = [
+const BASE_BOOKING_TYPES = [
   { key: "booking", label: "Booking.com", color: "#003580", bg: "#DCE6F5" },
   { key: "airbnb", label: "Airbnb", color: "#FF385C", bg: "#FCE1E6" },
   { key: "syndicate", label: "نقابات", color: "#8C6A4F", bg: "#EFE6DB" },
   { key: "sun", label: "SUN", color: "#0F766E", bg: "#D5EEEB" },
-  { key: "other", label: "Others", color: "#6B7280", bg: "#E7E9EC" },
 ];
+const OTHER_BOOKING_TYPE = { key: "other", label: "Others", color: "#6B7280", bg: "#E7E9EC" };
+// Palette used for companies added from the manager/analyst console.
+const COMPANY_COLORS = [
+  { color: "#7C3AED", bg: "#EADFFB" },
+  { color: "#B45309", bg: "#FBE9CC" },
+  { color: "#0E7490", bg: "#D3EEF4" },
+  { color: "#BE185D", bg: "#FADCE9" },
+  { color: "#4D7C0F", bg: "#E3EFCB" },
+  { color: "#1D4ED8", bg: "#DBE5FB" },
+];
+// BOOKING_TYPES / BOOKING_TYPE_FILTERS are mutated in place (never reassigned) so every
+// component that reads them sees companies the moment applyCompanyTypes() runs.
+// "Others" must stay last: bookingTypeMeta() falls back to the last entry.
+const BOOKING_TYPES = [...BASE_BOOKING_TYPES, OTHER_BOOKING_TYPE];
+const BOOKING_TYPE_FILTERS = [{ key: "all", label: "All" }, ...BOOKING_TYPES];
+function applyCompanyTypes(companies) {
+  const extra = (companies || []).map((c, i) => {
+    const pal = COMPANY_COLORS[i % COMPANY_COLORS.length];
+    return { key: c.key, label: c.label, color: c.color || pal.color, bg: c.bg || pal.bg, isCompany: true };
+  });
+  BOOKING_TYPES.length = 0;
+  BOOKING_TYPES.push(...BASE_BOOKING_TYPES, ...extra, OTHER_BOOKING_TYPE);
+  BOOKING_TYPE_FILTERS.length = 0;
+  BOOKING_TYPE_FILTERS.push({ key: "all", label: "All" }, ...BOOKING_TYPES);
+}
 const PAYMENT_METHODS = [
   { key: "online", label: "Online" },
   { key: "on_arrival", label: "الدفع عند الوصول" },
@@ -143,7 +167,6 @@ function paymentMethodLabel(key) {
   const m = PAYMENT_METHODS.find((x) => x.key === key);
   return m ? m.label : "";
 }
-const BOOKING_TYPE_FILTERS = [{ key: "all", label: "All" }, ...BOOKING_TYPES];
 function bookingTypeMeta(key) {
   return BOOKING_TYPES.find((t) => t.key === key) || BOOKING_TYPES[BOOKING_TYPES.length - 1];
 }
@@ -746,8 +769,9 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
   const [roomRates, setRoomRates] = useState(ROOM_RATES);
   const [mealPlanRates, setMealPlanRates] = useState(MEAL_PLAN_RATES);
   const [extraUsers, setExtraUsers] = useState([]);
+  const [companies, setCompanies] = useState([]);
   const [tab, setTab] = useState("rooms");
-  const [managerTab, setManagerTab] = useState("home");
+  const [managerTab, setManagerTab] = useState(role === "manager" || role === "analyst" ? "analytics" : "home");
   const [selectedRoom, setSelectedRoom] = useState(null);
   const [showNewBooking, setShowNewBooking] = useState(false);
   const [showNewGuest, setShowNewGuest] = useState(false);
@@ -795,6 +819,15 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
           const mr = {};
           (mealRateRows || []).forEach((x) => { mr[x.plan] = Number(x.rate); });
           setMealPlanRates(Object.keys(mr).length ? mr : MEAL_PLAN_RATES);
+          // Companies live in their own table; if the SQL hasn't been run yet just skip them.
+          try {
+            const coRows = await supabaseRest(`booking_companies?hotel_id=eq.${hid}&order=created_at`, { accessToken: token });
+            const list = (coRows || []).map((c) => ({ id: c.id, key: c.key, label: c.label }));
+            applyCompanyTypes(list);
+            setCompanies(list);
+          } catch (e2) {
+            console.warn("booking_companies not available (run supabase/companies_and_rooms.sql)", e2.message);
+          }
         } catch (e) {
           setError("Couldn't load data from Supabase — check your connection and refresh.");
         } finally {
@@ -814,6 +847,8 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
           setRoomRates(data.roomRates && Object.keys(data.roomRates).length ? data.roomRates : ROOM_RATES);
           setMealPlanRates(data.mealPlanRates && Object.keys(data.mealPlanRates).length ? data.mealPlanRates : MEAL_PLAN_RATES);
           setExtraUsers(data.extraUsers || []);
+          applyCompanyTypes(data.companies || []);
+          setCompanies(data.companies || []);
         } else {
           setRooms(defaultRooms());
         }
@@ -844,6 +879,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
           roomRates: next.roomRates ?? roomRates,
           mealPlanRates: next.mealPlanRates ?? mealPlanRates,
           extraUsers: next.extraUsers ?? extraUsers,
+          companies: next.companies ?? companies,
         }),
         true
       );
@@ -889,6 +925,94 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
     }
     setRoomRates(next);
     persist({ roomRates: next });
+  };
+  const addCompany = async (label) => {
+    const name = String(label || "").trim();
+    if (!name) return "Enter a company name.";
+    if (BOOKING_TYPES.some((t) => t.label.trim().toLowerCase() === name.toLowerCase())) return "That name already exists in Booking type.";
+    const key = `co_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+    if (supabaseSession) {
+      try {
+        const rows = await supabaseRest("booking_companies", {
+          accessToken: supabaseSession.access_token,
+          method: "POST",
+          body: { hotel_id: supabaseSession.hotelId, key, label: name },
+        });
+        const row = rows && rows[0];
+        const next = [...companies, { id: row?.id, key, label: name }];
+        applyCompanyTypes(next);
+        setCompanies(next);
+      } catch (e) {
+        return `Couldn't save the company: ${e.message}`;
+      }
+      return "";
+    }
+    const next = [...companies, { key, label: name }];
+    applyCompanyTypes(next);
+    setCompanies(next);
+    persist({ companies: next });
+    return "";
+  };
+  const deleteCompany = async (key) => {
+    const target = companies.find((c) => c.key === key);
+    if (!target) return;
+    if (supabaseSession) {
+      try {
+        await supabaseRest(`booking_companies?hotel_id=eq.${supabaseSession.hotelId}&key=eq.${encodeURIComponent(key)}`, {
+          accessToken: supabaseSession.access_token,
+          method: "DELETE",
+        });
+      } catch (e) {
+        flashError(`Couldn't delete the company: ${e.message}`);
+        return;
+      }
+    }
+    const next = companies.filter((c) => c.key !== key);
+    applyCompanyTypes(next);
+    setCompanies(next);
+    if (!supabaseSession) persist({ companies: next });
+  };
+  const addRoom = async ({ number, floor, type, status, notes }) => {
+    const num = String(number || "").trim();
+    if (!num) return "Enter a room number.";
+    if (rooms.some((r) => String(r.number) === num)) return `Room ${num} already exists.`;
+    const base = {
+      number: num,
+      floor: Number(floor),
+      type,
+      status,
+      notes: notes || "",
+      maintenanceBaseline: 0,
+      lastCleanedDate: null,
+    };
+    if (supabaseSession) {
+      try {
+        const rows = await supabaseRest("rooms", {
+          accessToken: supabaseSession.access_token,
+          method: "POST",
+          body: {
+            hotel_id: supabaseSession.hotelId,
+            number: num,
+            floor: base.floor,
+            type,
+            status,
+            notes: base.notes,
+            maintenance_baseline: 0,
+          },
+        });
+        if (!rows || !rows[0]) return "The room wasn't saved (missing INSERT permission — run supabase/companies_and_rooms.sql).";
+        const added = mapRoomFromDb(rows[0]);
+        setRooms((prev) => [...prev, added].sort((a, b) => String(a.number).localeCompare(String(b.number), undefined, { numeric: true })));
+      } catch (e) {
+        return `Couldn't save the room: ${e.message}`;
+      }
+      return "";
+    }
+    const next = [...rooms, { ...base, rate: roomRates[type] || ROOM_RATES[type] }].sort((a, b) =>
+      String(a.number).localeCompare(String(b.number), undefined, { numeric: true })
+    );
+    updateRooms(next);
+    return "";
   };
   const updateMealPlanRates = async (next) => {
     if (supabaseSession) {
@@ -1084,6 +1208,34 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
 
   const guestName = (guestId) => guests.find((g) => g.id === guestId)?.name || "Unknown guest";
 
+  // Staff audit trail. Best-effort: a failed log write must never block the desk,
+  // but it is reported to the console so a missing table is easy to spot.
+  const [localLogs, setLocalLogs] = useState([]);
+  const logAction = async (action, { roomNumber = "", bookingId = null, details = "", risk = "normal" } = {}) => {
+    if (supabaseSession) {
+      try {
+        await supabaseRest("staff_logs", {
+          accessToken: supabaseSession.access_token,
+          method: "POST",
+          body: {
+            hotel_id: supabaseSession.hotelId,
+            user_id: supabaseSession.user.id,
+            staff_name: username,
+            action,
+            room_number: roomNumber || null,
+            booking_id: bookingId,
+            details: details || null,
+            risk,
+          },
+        });
+      } catch (e) {
+        console.warn("staff_logs write failed (run supabase/manager_dashboard.sql?)", e.message);
+      }
+      return;
+    }
+    setLocalLogs((l) => [{ id: uid(), action, roomNumber, bookingId, details, risk, staffName: username || "Local user", createdAt: new Date().toISOString() }, ...l].slice(0, 300));
+  };
+
   const checkIn = async (bookingId) => {
     const booking = bookings.find((b) => b.id === bookingId);
     if (!booking) return;
@@ -1113,6 +1265,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         }
         setBookings((bs) => bs.map((b) => (b.id === bookingId ? { ...b, status: "checked_in" } : b)));
         setRooms((rs) => rs.map((r) => (r.number === booking.roomNumber ? { ...r, status: "occupied" } : r)));
+        logAction("Check-in", { roomNumber: booking.roomNumber, bookingId, details: guestName(booking.guestId) });
       } catch (e) {
         flashError(`Couldn't check in: ${e.message}`);
       }
@@ -1127,6 +1280,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
     setBookings(nextBookings);
     setRooms(nextRooms);
     persist({ bookings: nextBookings, rooms: nextRooms });
+    logAction("Check-in", { roomNumber: booking.roomNumber, bookingId, details: guestName(booking.guestId) });
   };
 
   const checkOut = async (bookingId) => {
@@ -1149,6 +1303,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         }
         setBookings((bs) => bs.map((b) => (b.id === bookingId ? { ...b, status: "checked_out" } : b)));
         setRooms((rs) => rs.map((r) => (r.number === booking.roomNumber ? { ...r, status: "vacant_dirty" } : r)));
+        logAction("Check-out", { roomNumber: booking.roomNumber, bookingId, details: guestName(booking.guestId) });
       } catch (e) {
         flashError(`Couldn't check out: ${e.message}`);
       }
@@ -1163,9 +1318,12 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
     setBookings(nextBookings);
     setRooms(nextRooms);
     persist({ bookings: nextBookings, rooms: nextRooms });
+    logAction("Check-out", { roomNumber: booking.roomNumber, bookingId, details: guestName(booking.guestId) });
   };
 
   const cancelBooking = async (bookingId) => {
+    const cancelled = bookings.find((b) => b.id === bookingId);
+    const cancelInfo = cancelled ? { roomNumber: cancelled.roomNumber, bookingId, details: `${guestName(cancelled.guestId)} · ${fmtDate(cancelled.checkIn)} → ${fmtDate(cancelled.checkOut)}`, risk: "warn" } : { bookingId, risk: "warn" };
     if (supabaseSession) {
       try {
         await supabaseRest(`bookings?id=eq.${bookingId}`, {
@@ -1174,6 +1332,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
           body: { status: "cancelled" },
         });
         setBookings((bs) => bs.map((b) => (b.id === bookingId ? { ...b, status: "cancelled" } : b)));
+        logAction("Cancel Booking", cancelInfo);
       } catch (e) {
         flashError(`Couldn't cancel booking: ${e.message}`);
       }
@@ -1183,6 +1342,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
       b.id === bookingId ? { ...b, status: "cancelled" } : b
     );
     updateBookings(nextBookings);
+    logAction("Cancel Booking", cancelInfo);
   };
 
   // Edit a reservation / in-house stay: booking fields + the guest's own data.
@@ -1190,6 +1350,19 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
     const booking = bookings.find((b) => b.id === bookingId);
     if (!booking) return;
     const newRoomNumber = fields.roomNumber !== undefined ? fields.roomNumber : booking.roomNumber;
+    const auditEntries = [];
+    {
+      const gn = guestName(booking.guestId);
+      const oldTotal = Number(booking.totalAmount) || 0;
+      const newTotal = fields.totalAmount !== undefined ? Number(fields.totalAmount) || 0 : oldTotal;
+      const oldDisc = Number(booking.discountPercent) || 0;
+      const newDisc = fields.discountPercent !== undefined ? Number(fields.discountPercent) || 0 : oldDisc;
+      if (newTotal !== oldTotal) auditEntries.push({ action: "Price Override", risk: "high", details: `${gn}: total ${fmtMoney(oldTotal)} → ${fmtMoney(newTotal)}` });
+      if (newDisc !== oldDisc) auditEntries.push({ action: "Manual Discount", risk: newDisc > oldDisc ? (newDisc >= 20 ? "high" : "warn") : "normal", details: `${gn}: discount ${oldDisc}% → ${newDisc}%` });
+      if ((newRoomNumber || "") !== (booking.roomNumber || "")) auditEntries.push({ action: "Room Change", risk: "warn", details: `${gn}: ${booking.roomNumber || "no room"} → ${newRoomNumber || "no room"}` });
+      const otherChanged = ["checkIn", "checkOut", "persons", "bookingType", "paymentMethod"].some((k) => fields[k] !== undefined && String(fields[k] || "") !== String(booking[k] || "")) || (fields.mealPlans !== undefined && JSON.stringify(fields.mealPlans) !== JSON.stringify(booking.mealPlans || []));
+      if (otherChanged || (guestPatch && auditEntries.length === 0)) auditEntries.push({ action: "Booking Edit", risk: "normal", details: gn });
+    }
     const merged = { ...booking, ...fields, roomNumber: newRoomNumber, roomId: (rooms.find((r) => r.number === newRoomNumber) || {}).id || null, partySize: fields.persons ?? booking.persons };
     if (supabaseSession) {
       try {
@@ -1223,6 +1396,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         }
         await supabasePatchChecked(`bookings?id=eq.${bookingId}`, { accessToken: token, body, what: "Booking changes" });
         setBookings((bs) => bs.map((b) => (b.id === bookingId ? merged : b)));
+        auditEntries.forEach((en) => logAction(en.action, { roomNumber: newRoomNumber, bookingId, details: en.details, risk: en.risk }));
       } catch (e) {
         flashError(`Couldn't save changes: ${e.message}`);
       }
@@ -1233,6 +1407,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
     setGuests(nextGuests);
     setBookings(nextBookings);
     persist({ guests: nextGuests, bookings: nextBookings });
+    auditEntries.forEach((en) => logAction(en.action, { roomNumber: newRoomNumber, bookingId, details: en.details, risk: en.risk }));
   };
 
   // Move an in-house guest to another room: old room -> dirty, new room -> occupied.
@@ -1273,6 +1448,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             flashError(`Room switched, but the reason wasn't saved: ${e.message}`);
           }
         }
+        logAction("Room Switch", { roomNumber: newRoomNumber, bookingId, details: `${guestName(booking.guestId)}: ${booking.roomNumber} → ${newRoomNumber} · ${(reason || "").trim()}`, risk: role === "manager" ? "normal" : "warn" });
         setRooms((rs) =>
           rs.map((r) =>
             r.number === newRoomNumber ? { ...r, status: "occupied" } : r.number === booking.roomNumber ? { ...r, status: "vacant_dirty" } : r
@@ -1294,6 +1470,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
     setRooms(nextRooms);
     setGuests(nextGuests);
     persist({ bookings: nextBookings, rooms: nextRooms, guests: nextGuests });
+    logAction("Room Switch", { roomNumber: newRoomNumber, bookingId, details: `${guestName(booking.guestId)}: ${booking.roomNumber} → ${newRoomNumber} · ${(reason || "").trim()}`, risk: role === "manager" ? "normal" : "warn" });
   };
 
   const updateGuestTags = async (guestId, tags) => {
@@ -1355,6 +1532,13 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
   };
 
   const reserveRoom = async ({ roomNumber, guestId, newGuest, checkIn: ci, checkOut: co, checkInNow, persons, mealPlans, bookingType, paymentMethod, discountPercent, totalAmount }) => {
+    const logReserve = (gid, ng, bid) => {
+      const gn = ng ? ng.name : guestName(gid);
+      logAction("New Booking", { roomNumber, bookingId: bid, details: `${gn} · ${fmtDate(ci)} → ${fmtDate(co)}${totalAmount ? ` · ${fmtMoney(totalAmount)}` : ""}` });
+      if (Number(discountPercent) > 0) {
+        logAction("Manual Discount", { roomNumber, bookingId: bid, details: `${gn}: ${discountPercent}% discount on a new booking`, risk: Number(discountPercent) >= 20 ? "high" : "warn" });
+      }
+    };
     if (supabaseSession) {
       try {
         let finalGuestId = guestId;
@@ -1406,6 +1590,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
             setSelectedRoom((s) => ({ ...s, status: "occupied" }));
           }
         }
+        logReserve(finalGuestId, newGuest, insertedBooking.id);
         return true;
       } catch (e) {
         flashError(`Couldn't save booking: ${e.message}`);
@@ -1445,6 +1630,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
     if (selectedRoom && selectedRoom.number === roomNumber && checkInNow) {
       setSelectedRoom({ ...selectedRoom, status: "occupied" });
     }
+    logReserve(finalGuestId, newGuest, booking.id);
     return true;
   };
 
@@ -1501,7 +1687,7 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
     );
   }
 
-  if (role === "manager") {
+  if (role === "manager" || role === "analyst") {
     return (
       <div
         style={{
@@ -1524,14 +1710,14 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
           }}
         >
           <div
-            onClick={() => setManagerTab("home")}
+            onClick={() => setManagerTab("analytics")}
             style={{ display: "flex", alignItems: "baseline", gap: "0.75rem", cursor: "pointer" }}
           >
             <span style={{ fontFamily: "Fraunces, serif", fontSize: "1.5rem", fontWeight: 600, letterSpacing: "0.01em" }}>
               Geisum Hotel
             </span>
             <span style={{ fontSize: "0.75rem", color: TOKENS.brass, letterSpacing: "0.08em", textTransform: "uppercase" }}>
-              Manager console
+              {role === "analyst" ? "Analyst console" : "Manager console"}
             </span>
           </div>
           <button
@@ -1550,45 +1736,6 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
           </button>
         </header>
 
-        <nav
-          style={{
-            display: "flex",
-            gap: "0.25rem",
-            padding: "0.75rem 1.5rem 0",
-            borderBottom: `1px solid ${TOKENS.paperDim}`,
-            background: TOKENS.paper,
-            flexWrap: "wrap",
-          }}
-        >
-          {[
-            { id: "analytics", label: "Analytics" },
-            { id: "roomActivity", label: "Room activity" },
-            { id: "ticketRecords", label: "Ticket records" },
-            { id: "todayReport", label: "Today report" },
-            { id: "pricing", label: "Room pricing" },
-            { id: "users", label: "Users" },
-          ].map((t) => (
-            <button
-              key={t.id}
-              onClick={() => setManagerTab(t.id)}
-              style={{
-                border: "none",
-                background: "transparent",
-                padding: "0.6rem 1rem",
-                fontFamily: "Inter, sans-serif",
-                fontSize: "0.9rem",
-                fontWeight: 500,
-                color: managerTab === t.id ? TOKENS.ink : TOKENS.inkSoft,
-                borderBottom: managerTab === t.id ? `2px solid ${TOKENS.brass}` : "2px solid transparent",
-                cursor: "pointer",
-                opacity: managerTab === t.id ? 1 : 0.6,
-              }}
-            >
-              {t.label}
-            </button>
-          ))}
-        </nav>
-
         {error && (
           <div style={{ background: TOKENS.oosBg, color: TOKENS.oos, padding: "0.5rem 1.5rem", fontSize: "0.85rem" }}>
             {error}
@@ -1596,20 +1743,32 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
         )}
 
         <main style={{ padding: "1.5rem", maxWidth: 1100, margin: "0 auto" }}>
-          {managerTab === "home" && (
-            <TabHomeScreen
-              tabs={[
-                { id: "analytics", label: "Analytics" },
-                { id: "roomActivity", label: "Room activity" },
-                { id: "ticketRecords", label: "Ticket records" },
-                { id: "todayReport", label: "Today report" },
-                { id: "pricing", label: "Room pricing" },
-                { id: "users", label: "Users" },
-              ]}
-              onSelect={setManagerTab}
-            />
+          {managerTab !== "analytics" && (
+            <button onClick={() => setManagerTab("analytics")} style={{ ...ghostBtn, marginBottom: "1rem", display: "inline-flex", alignItems: "center", gap: 6, minHeight: 40 }}>
+              ← Back to dashboard
+            </button>
           )}
           {managerTab === "analytics" && (
+            <ManagerDashboard
+              rooms={rooms}
+              bookings={bookings}
+              guests={guests}
+              guestName={guestName}
+              accessToken={supabaseSession?.access_token}
+              hotelId={supabaseSession?.hotelId}
+              userId={supabaseSession?.user?.id}
+              username={username}
+              role={role}
+              localLogs={localLogs}
+              onCheckIn={checkIn}
+              onCheckOut={checkOut}
+              onCancel={cancelBooking}
+              onAssignRoom={(bookingId, roomNumber) => updateBooking(bookingId, { roomNumber })}
+              onMarkClean={(number) => setRoomStatus(number, "vacant_clean", "")}
+              onNavigate={setManagerTab}
+            />
+          )}
+          {managerTab === "revenue" && (
             <AnalyticsDashboard
               rooms={rooms}
               bookings={bookings}
@@ -1652,7 +1811,13 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
               onSaveMealPlans={updateMealPlanRates}
             />
           )}
-          {managerTab === "users" && (
+          {managerTab === "companies" && (
+            <CompaniesTab companies={companies} onAdd={addCompany} onDelete={deleteCompany} />
+          )}
+          {managerTab === "rooms" && (
+            <RoomsManageTab rooms={rooms} bookings={bookings} roomRates={roomRates} onAddRoom={addRoom} />
+          )}
+          {managerTab === "users" && role === "manager" && (
             <UsersTab extraUsers={extraUsers} onAddUser={addUser} onDeleteUser={deleteUser} supabaseSession={supabaseSession} />
           )}
         </main>
@@ -1662,157 +1827,6 @@ function HotelReceptionApp({ role, username, supabaseSession, onLogout }) {
 
   if (role === "accountant") {
     return <AccountantConsole supabaseSession={supabaseSession} onLogout={onLogout} />;
-  }
-
-  if (role === "analyst") {
-    return (
-      <div
-        style={{
-          fontFamily: "Inter, sans-serif",
-          background: TOKENS.paper,
-          minHeight: "100vh",
-          color: TOKENS.ink,
-        }}
-      >
-        <header
-          style={{
-            background: TOKENS.ink,
-            color: TOKENS.paper,
-            padding: "1.25rem 1.5rem",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            flexWrap: "wrap",
-            gap: "0.75rem",
-          }}
-        >
-          <div
-            onClick={() => setManagerTab("home")}
-            style={{ display: "flex", alignItems: "baseline", gap: "0.75rem", cursor: "pointer" }}
-          >
-            <span style={{ fontFamily: "Fraunces, serif", fontSize: "1.5rem", fontWeight: 600, letterSpacing: "0.01em" }}>
-              Geisum Hotel
-            </span>
-            <span style={{ fontSize: "0.75rem", color: TOKENS.brass, letterSpacing: "0.08em", textTransform: "uppercase" }}>
-              View access · pricing editable
-            </span>
-          </div>
-          <button
-            onClick={onLogout}
-            style={{
-              background: "rgba(255,255,255,0.08)",
-              border: "1px solid rgba(255,255,255,0.2)",
-              borderRadius: 8,
-              padding: "0.4rem 0.8rem",
-              color: TOKENS.paper,
-              fontSize: "0.8rem",
-              cursor: "pointer",
-            }}
-          >
-            Sign out
-          </button>
-        </header>
-
-        <nav
-          style={{
-            display: "flex",
-            gap: "0.25rem",
-            padding: "0.75rem 1.5rem 0",
-            borderBottom: `1px solid ${TOKENS.paperDim}`,
-            background: TOKENS.paper,
-            flexWrap: "wrap",
-          }}
-        >
-          {[
-            { id: "analytics", label: "Analytics" },
-            { id: "roomActivity", label: "Room activity" },
-            { id: "ticketRecords", label: "Ticket records" },
-            { id: "todayReport", label: "Today report" },
-            { id: "pricing", label: "Room pricing" },
-          ].map((t) => (
-            <button
-              key={t.id}
-              onClick={() => setManagerTab(t.id)}
-              style={{
-                border: "none",
-                background: "transparent",
-                padding: "0.6rem 1rem",
-                fontFamily: "Inter, sans-serif",
-                fontSize: "0.9rem",
-                fontWeight: 500,
-                color: managerTab === t.id ? TOKENS.ink : TOKENS.inkSoft,
-                borderBottom: managerTab === t.id ? `2px solid ${TOKENS.brass}` : "2px solid transparent",
-                cursor: "pointer",
-                opacity: managerTab === t.id ? 1 : 0.6,
-              }}
-            >
-              {t.label}
-            </button>
-          ))}
-        </nav>
-
-        {error && (
-          <div style={{ background: TOKENS.oosBg, color: TOKENS.oos, padding: "0.5rem 1.5rem", fontSize: "0.85rem" }}>
-            {error}
-          </div>
-        )}
-
-        <main style={{ padding: "1.5rem", maxWidth: 1100, margin: "0 auto" }}>
-          {managerTab === "home" && (
-            <TabHomeScreen
-              tabs={[
-                { id: "analytics", label: "Analytics" },
-                { id: "roomActivity", label: "Room activity" },
-                { id: "ticketRecords", label: "Ticket records" },
-                { id: "todayReport", label: "Today report" },
-                { id: "pricing", label: "Room pricing" },
-              ]}
-              onSelect={setManagerTab}
-            />
-          )}
-          {managerTab === "analytics" && (
-            <AnalyticsDashboard
-              rooms={rooms}
-              bookings={bookings}
-              maintenanceLog={maintenanceLog}
-              roomRates={roomRates}
-              mealPlanRates={mealPlanRates}
-              tickets={tickets}
-              accessToken={supabaseSession?.access_token}
-              hotelId={supabaseSession?.hotelId}
-              guestName={guestName}
-            />
-          )}
-          {managerTab === "roomActivity" && (
-            <RoomActivityTab
-              rooms={rooms}
-              bookings={bookings}
-              maintenanceLog={maintenanceLog}
-              roomRates={roomRates}
-              mealPlanRates={mealPlanRates}
-            />
-          )}
-          {managerTab === "ticketRecords" && (
-            <TicketRecordsTab
-              accessToken={supabaseSession?.access_token}
-              hotelId={supabaseSession?.hotelId}
-              localTickets={tickets}
-            />
-          )}
-          {managerTab === "todayReport" && (
-            <TodayReportTab rooms={rooms} bookings={bookings} roomRates={roomRates} mealPlanRates={mealPlanRates} accessToken={supabaseSession?.access_token} hotelId={supabaseSession?.hotelId} guestName={guestName} />
-          )}
-          {managerTab === "pricing" && (
-            <RoomPricingTab
-              roomRates={roomRates}
-              mealPlanRates={mealPlanRates}
-              onSave={updateRoomRates}
-              onSaveMealPlans={updateMealPlanRates}
-            />
-          )}
-        </main>
-      </div>
-    );
   }
 
   return (
@@ -4251,6 +4265,15 @@ const ICON_PATHS = {
   eye: '<path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>',
   history: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
   alert: '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+  shield: '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4"/><path d="M12 16h.01"/>',
+  pin: '<path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+  trash: '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+  refresh: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+  note: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/>',
+  chart: '<path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/>',
+  grid: '<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/>',
+  cash: '<rect width="20" height="12" x="2" y="6" rx="2"/><circle cx="12" cy="12" r="2"/><path d="M6 12h.01M18 12h.01"/>',
   plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
   edit: '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>',
   logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>',
@@ -5538,6 +5561,969 @@ function AnalyticsDashboard({ rooms, bookings, maintenanceLog, onLogout, roomRat
         </div>
       </div>
       </>
+      )}
+    </div>
+  );
+}
+
+// ───────────────────────── Reception Manager Dashboard ─────────────────────────
+
+const MD_CSS = `
+.md-kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 899px) { .md-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 479px) { .md-kpis { grid-template-columns: minmax(0, 1fr); } }
+.md-cols { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 899px) { .md-cols { grid-template-columns: minmax(0, 1fr); } }
+.md-glass { background: rgba(255,255,255,.72); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,.9); border-radius: 16px; box-shadow: 0 2px 12px rgba(27,36,48,.06); }
+.md-scroll { display: flex; gap: 6px; overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 2px; }
+.md-scroll::-webkit-scrollbar { display: none; }
+.md-tabbar { position: sticky; top: 0; z-index: 20; }
+.md-btn { min-height: 44px; }
+`;
+
+const SHIFTS = [
+  { key: "all", label: "All shifts", from: 0, to: 24 },
+  { key: "morning", label: "Morning", sub: "06–14", from: 6, to: 14 },
+  { key: "evening", label: "Evening", sub: "14–22", from: 14, to: 22 },
+  { key: "night", label: "Night", sub: "22–06", from: 22, to: 6 },
+];
+function shiftOfDate(d) {
+  const h = d.getHours();
+  if (h >= 6 && h < 14) return "morning";
+  if (h >= 14 && h < 22) return "evening";
+  return "night";
+}
+
+const AUDIT_ACTIONS = {
+  "Check-in": { icon: "login", color: TOKENS.clean, bg: TOKENS.cleanBg, group: "checkin" },
+  "Check-out": { icon: "logout", color: "#C9722B", bg: "#FBE7D2", group: "checkout" },
+  "New Booking": { icon: "plus", color: TOKENS.reserved, bg: TOKENS.reservedBg, group: "booking" },
+  "Booking Edit": { icon: "edit", color: TOKENS.inkSoft, bg: TOKENS.paper, group: "booking" },
+  "Cancel Booking": { icon: "ban", color: TOKENS.oos, bg: TOKENS.oosBg, group: "booking" },
+  "Room Switch": { icon: "swap", color: TOKENS.dirty, bg: TOKENS.dirtyBg, group: "room" },
+  "Room Change": { icon: "swap", color: TOKENS.dirty, bg: TOKENS.dirtyBg, group: "room" },
+  "Manual Discount": { icon: "alert", color: TOKENS.oos, bg: TOKENS.oosBg, group: "pricing" },
+  "Price Override": { icon: "alert", color: TOKENS.oos, bg: TOKENS.oosBg, group: "pricing" },
+};
+const AUDIT_FILTERS = [
+  { key: "all", label: "All" },
+  { key: "risk", label: "High risk" },
+  { key: "checkin", label: "Check-ins" },
+  { key: "checkout", label: "Check-outs" },
+  { key: "room", label: "Room changes" },
+  { key: "pricing", label: "Pricing" },
+  { key: "booking", label: "Bookings" },
+];
+
+function mapLogFromDb(r) {
+  return {
+    id: r.id,
+    staffName: r.staff_name || "Unknown",
+    action: r.action,
+    roomNumber: r.room_number || "",
+    bookingId: r.booking_id || null,
+    details: r.details || "",
+    risk: r.risk || "normal",
+    createdAt: r.created_at,
+  };
+}
+function mapNoteFromDb(r) {
+  return {
+    id: r.id,
+    body: r.body,
+    shift: r.shift || "all",
+    urgent: !!r.urgent,
+    pinned: !!r.pinned,
+    resolved: !!r.resolved,
+    authorName: r.author_name || "",
+    createdAt: r.created_at,
+  };
+}
+function whenLabel(iso) {
+  const d = new Date(iso);
+  const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (day === todayISO()) return `Today ${time}`;
+  if (day === addDaysISO(todayISO(), -1)) return `Yesterday ${time}`;
+  return `${fmtDate(day)} ${time}`;
+}
+function netAmount(b) {
+  return (Number(b.totalAmount) || 0) * (1 - (Number(b.discountPercent) || 0) / 100);
+}
+
+function Gauge({ value, color, label, sub }) {
+  const pct = Math.max(0, Math.min(100, value));
+  const r = 52;
+  const c = Math.PI * r;
+  return (
+    <div style={{ textAlign: "center" }}>
+      <svg viewBox="0 0 140 84" width="100%" style={{ maxWidth: 220 }} role="img" aria-label={`${label}: ${Math.round(pct)}%`}>
+        <path d="M 18 76 A 52 52 0 0 1 122 76" fill="none" stroke={TOKENS.paperDim} strokeWidth="12" strokeLinecap="round" />
+        <path d="M 18 76 A 52 52 0 0 1 122 76" fill="none" stroke={color} strokeWidth="12" strokeLinecap="round" strokeDasharray={`${(pct / 100) * c} ${c}`} style={{ transition: "stroke-dasharray .6s ease" }} />
+        <text x="70" y="68" textAnchor="middle" fontSize="24" fontWeight="700" fontFamily="Fraunces, serif" fill={TOKENS.ink}>
+          {Math.round(pct)}%
+        </text>
+      </svg>
+      <div style={{ fontWeight: 600, fontSize: "0.85rem" }}>{label}</div>
+      {sub && <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft, marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function BarRow({ label, value, max, color, right }) {
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.8rem", marginBottom: 4, gap: 8 }}>
+        <span style={{ fontWeight: 600 }}>{label}</span>
+        <span style={{ color: TOKENS.inkSoft }}>{right}</span>
+      </div>
+      <div style={{ height: 8, background: TOKENS.paperDim, borderRadius: 999, overflow: "hidden" }}>
+        <div style={{ width: `${max ? Math.max(2, (value / max) * 100) : 0}%`, height: "100%", background: color, borderRadius: 999, transition: "width .5s ease" }} />
+      </div>
+    </div>
+  );
+}
+
+function ManagerDashboard({ rooms, bookings, guests, guestName, accessToken, hotelId, userId, username, role, localLogs, initialTab = "overview", onCheckIn, onCheckOut, onCancel, onAssignRoom, onMarkClean, onNavigate }) {
+  const mobile = useIsMobile();
+  const today = todayISO();
+  const [tab, setTab] = useState(initialTab);
+  const [rangeStart, setRangeStart] = useState(today);
+  const [rangeEnd, setRangeEnd] = useState(today);
+  const [shift, setShift] = useState("all");
+  const [logs, setLogs] = useState([]);
+  const [notes, setNotes] = useState([]);
+  const [localNotes, setLocalNotes] = useState([]);
+  const [rangeBookings, setRangeBookings] = useState(() => (hotelId ? [] : bookings));
+  const [loading, setLoading] = useState(!!hotelId);
+  const [dbError, setDbError] = useState("");
+  const [lastSync, setLastSync] = useState(null);
+  const [auditFilter, setAuditFilter] = useState("all");
+  const [staffFilter, setStaffFilter] = useState("all");
+  const [draft, setDraft] = useState({ body: "", urgent: false, pinned: false, shift: "all" });
+  const [noteBusy, setNoteBusy] = useState(false);
+  const [noteError, setNoteError] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [showResolved, setShowResolved] = useState(false);
+  const [tick, setTick] = useState(0);
+  const [busyId, setBusyId] = useState(null);
+  const [confirmCancel, setConfirmCancel] = useState(null);
+  const [assigning, setAssigning] = useState({});
+
+  const roomNumberById = useMemo(() => {
+    const map = {};
+    (rooms || []).forEach((r) => {
+      map[r.id] = r.number;
+    });
+    return map;
+  }, [rooms]);
+
+  // Load logs (for the selected range), notes and the range's bookings.
+  // Polls every 30s while the tab is visible — a light stand-in for realtime
+  // that needs no websocket client.
+  useEffect(() => {
+    let cancelled = false;
+    const startIso = new Date(`${rangeStart}T00:00:00`).toISOString();
+    const endIso = new Date(`${addDaysISO(rangeEnd, 1)}T00:00:00`).toISOString();
+    const load = async () => {
+      if (!hotelId) {
+        setBookings0();
+        return;
+      }
+      try {
+        const [lg, nt, bk] = await Promise.all([
+          supabaseRest(`staff_logs?hotel_id=eq.${hotelId}&created_at=gte.${startIso}&created_at=lt.${endIso}&order=created_at.desc&limit=500`, { accessToken }),
+          supabaseRest(`shift_notes?hotel_id=eq.${hotelId}&order=created_at.desc&limit=150`, { accessToken }),
+          fetchBookingsOverlappingRange({ accessToken, hotelId, rangeStart, rangeEndExclusive: addDaysISO(rangeEnd, 1), roomNumberById }),
+        ]);
+        if (cancelled) return;
+        setLogs((lg || []).map(mapLogFromDb));
+        setNotes((nt || []).map(mapNoteFromDb));
+        setRangeBookings(bk);
+        setDbError("");
+        setLastSync(new Date());
+      } catch (e) {
+        if (cancelled) return;
+        const missing = /42P01|does not exist|staff_logs|shift_notes|404/.test(String(e.message));
+        setDbError(
+          missing
+            ? "The dashboard tables don't exist yet. Run supabase/manager_dashboard.sql in the Supabase SQL editor, then press Refresh."
+            : `Couldn't load dashboard data: ${e.message}`
+        );
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    function setBookings0() {
+      setRangeBookings(bookings.filter((b) => b.checkIn < addDaysISO(rangeEnd, 1) && b.checkOut > rangeStart));
+      setLoading(false);
+      setLastSync(new Date());
+    }
+    if (hotelId) setLoading(true);
+    load();
+    const timer = setInterval(() => {
+      if (typeof document === "undefined" || document.visibilityState === "visible") load();
+    }, 30000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [accessToken, hotelId, rangeStart, rangeEnd, tick, roomNumberById, hotelId ? null : bookings]);
+
+  const allLogs = hotelId ? logs : (localLogs || []).filter((l) => l.createdAt >= new Date(`${rangeStart}T00:00:00`).toISOString() && l.createdAt < new Date(`${addDaysISO(rangeEnd, 1)}T00:00:00`).toISOString());
+  const allNotes = hotelId ? notes : localNotes;
+
+  const logsInShift = useMemo(
+    () => allLogs.filter((l) => shift === "all" || shiftOfDate(new Date(l.createdAt)) === shift),
+    [allLogs, shift]
+  );
+  const notesInShift = useMemo(() => allNotes.filter((n) => shift === "all" || n.shift === "all" || n.shift === shift), [allNotes, shift]);
+
+  // ── Today's operations (always "today", independent of the range filter) ──
+  const live = bookings.filter((b) => b.status !== "cancelled");
+  const arrivals = live.filter((b) => b.checkIn === today);
+  const arrDone = arrivals.filter((b) => b.status === "checked_in" || b.status === "checked_out").length;
+  const arrPending = arrivals.filter((b) => b.status === "reserved");
+  const departures = live.filter((b) => b.checkOut === today && b.status !== "reserved");
+  const depDone = departures.filter((b) => b.status === "checked_out").length;
+  const overdue = live.filter((b) => b.status === "checked_in" && b.checkOut < today);
+  const usable = rooms.filter((r) => r.status !== "out_of_order").length;
+  const occupied = rooms.filter((r) => r.status === "occupied").length;
+  const occPct = usable ? Math.round((occupied / usable) * 100) : 0;
+  const unassigned = live.filter((b) => !b.roomNumber && (b.status === "reserved" || b.status === "checked_in") && b.checkOut >= today);
+  const unassignedSoon = unassigned.filter((b) => b.checkIn <= addDaysISO(today, 1)).length;
+  const guestTags = (id) => splitGuestNotes((guests.find((g) => g.id === id) || {}).notes).tags;
+  const vipPending = arrPending.filter((b) => guestTags(b.guestId).includes("vip"));
+  const blacklistedPending = arrPending.filter((b) => guestTags(b.guestId).includes("blacklisted"));
+  const urgentOpen = allNotes.filter((n) => n.urgent && !n.resolved).length;
+  const highRisk = logsInShift.filter((l) => l.risk === "high");
+
+  const kpis = [
+    { key: "in", icon: "login", color: TOKENS.clean, bg: TOKENS.cleanBg, label: "Check-ins today", value: `${arrDone}/${arrivals.length}`, sub: `${arrPending.length} pending`, bar: arrivals.length ? arrDone / arrivals.length : 1, go: "overview" },
+    { key: "out", icon: "logout", color: "#C9722B", bg: "#FBE7D2", label: "Check-outs today", value: `${depDone}/${departures.length}`, sub: overdue.length ? `${overdue.length} overdue` : `${departures.length - depDone} pending`, subColor: overdue.length ? TOKENS.oos : undefined, bar: departures.length ? depDone / departures.length : 1 },
+    { key: "occ", icon: "bed", color: "#3B6FA0", bg: "#DCE9F5", label: "Occupancy", value: `${occPct}%`, sub: `${occupied}/${usable} rooms`, bar: occPct / 100 },
+    { key: "un", icon: "alert", color: unassigned.length ? TOKENS.oos : TOKENS.clean, bg: unassigned.length ? TOKENS.oosBg : TOKENS.cleanBg, label: "Unassigned rooms", value: unassigned.length, sub: unassigned.length ? `${unassignedSoon} arriving within 1 day` : "All bookings have a room" },
+    { key: "vip", icon: "star", color: "#8A5A00", bg: "#F8E9C8", label: "VIP arrivals pending", value: vipPending.length, sub: blacklistedPending.length ? `${blacklistedPending.length} blacklisted arriving!` : "Special guests today", subColor: blacklistedPending.length ? TOKENS.oos : undefined },
+    { key: "urgent", icon: "note", color: urgentOpen ? TOKENS.oos : TOKENS.inkSoft, bg: urgentOpen ? TOKENS.oosBg : TOKENS.paper, label: "Urgent notes open", value: urgentOpen, sub: highRisk.length ? `${highRisk.length} high-risk actions` : "No high-risk actions", subColor: highRisk.length ? TOKENS.oos : undefined },
+  ];
+
+  const staffNames = [...new Set(logsInShift.map((l) => l.staffName))].sort();
+  const filteredLogs = logsInShift.filter((l) => {
+    if (staffFilter !== "all" && l.staffName !== staffFilter) return false;
+    if (auditFilter === "all") return true;
+    if (auditFilter === "risk") return l.risk === "high" || l.risk === "warn";
+    return (AUDIT_ACTIONS[l.action] || {}).group === auditFilter;
+  });
+  const logCountByStaff = {};
+  logsInShift.forEach((l) => (logCountByStaff[l.staffName] = (logCountByStaff[l.staffName] || 0) + 1));
+
+  // ── Notes ──
+  const sortedNotes = [...notesInShift].sort((a, b) => Number(b.pinned) - Number(a.pinned) || Number(b.urgent) - Number(a.urgent) || b.createdAt.localeCompare(a.createdAt));
+  const openNotes = sortedNotes.filter((n) => !n.resolved);
+  const doneNotes = sortedNotes.filter((n) => n.resolved);
+
+  const patchNote = async (id, patch) => {
+    setNoteError("");
+    if (!hotelId) {
+      setLocalNotes((ns) => ns.map((n) => (n.id === id ? { ...n, ...patch } : n)));
+      return;
+    }
+    try {
+      await supabasePatchChecked(`shift_notes?id=eq.${id}`, { accessToken, body: patch, what: "Note update" });
+      setNotes((ns) => ns.map((n) => (n.id === id ? { ...n, ...patch } : n)));
+    } catch (e) {
+      setNoteError(e.message);
+    }
+  };
+  const postNote = async () => {
+    const body = draft.body.trim();
+    if (!body) return setNoteError("Write the note first.");
+    setNoteBusy(true);
+    setNoteError("");
+    try {
+      if (!hotelId) {
+        setLocalNotes((ns) => [{ id: uid(), body, shift: draft.shift, urgent: draft.urgent, pinned: draft.pinned, resolved: false, authorName: username, createdAt: new Date().toISOString() }, ...ns]);
+      } else {
+        const [row] = await supabaseRest("shift_notes", {
+          accessToken,
+          method: "POST",
+          body: { hotel_id: hotelId, author_id: userId, author_name: username, body, shift: draft.shift, urgent: draft.urgent, pinned: draft.pinned },
+        });
+        setNotes((ns) => [mapNoteFromDb(row), ...ns]);
+      }
+      setDraft({ body: "", urgent: false, pinned: false, shift: draft.shift });
+    } catch (e) {
+      setNoteError(/42501|row-level|policy/i.test(e.message) ? "Only a manager account can post notes (or the dashboard SQL hasn't been run)." : e.message);
+    } finally {
+      setNoteBusy(false);
+    }
+  };
+  const deleteNote = async (id) => {
+    setNoteError("");
+    try {
+      if (hotelId) {
+        const rows = await supabaseRest(`shift_notes?id=eq.${id}`, { accessToken, method: "DELETE" });
+        if (!Array.isArray(rows) || rows.length === 0) throw new Error("Note was not deleted (permission).");
+        setNotes((ns) => ns.filter((n) => n.id !== id));
+      } else setLocalNotes((ns) => ns.filter((n) => n.id !== id));
+    } catch (e) {
+      setNoteError(e.message);
+    }
+  };
+
+  // ── Analytics (range-based) ──
+  const rangeLive = rangeBookings.filter((b) => b.status !== "cancelled");
+  const channelStats = BOOKING_TYPES.map((t) => {
+    const list = rangeLive.filter((b) => (b.bookingType || "booking") === t.key);
+    return { ...t, count: list.length, revenue: list.reduce((s, b) => s + netAmount(b), 0) };
+  }).filter((c) => c.count > 0);
+  const channelMax = Math.max(1, ...channelStats.map((c) => c.count));
+  const mealCounts = {};
+  rangeLive.forEach((b) => {
+    const p = (b.mealPlans && b.mealPlans[0]) || "No plan";
+    mealCounts[p] = (mealCounts[p] || 0) + 1;
+  });
+  const mealEntries = Object.entries(mealCounts).sort((a, b) => b[1] - a[1]);
+  const mealTotal = mealEntries.reduce((s, [, n]) => s + n, 0);
+  const MEAL_COLORS = ["#3B6FA0", "#4A7C59", "#D98B3A", "#B08968", "#8A6BB0", "#C0502F", "#6B7280"];
+
+  // Check-in performance: was the guest checked in on their arrival date, and when in the day?
+  const bookingById = useMemo(() => {
+    const m = {};
+    bookings.concat(rangeBookings).forEach((b) => (m[b.id] = b));
+    return m;
+  }, [bookings, rangeBookings]);
+  const checkInLogs = logsInShift.filter((l) => l.action === "Check-in" && l.bookingId && bookingById[l.bookingId]);
+  const onDay = checkInLogs.filter((l) => {
+    const d = new Date(l.createdAt);
+    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    return iso === bookingById[l.bookingId].checkIn;
+  }).length;
+  const onDayPct = checkInLogs.length ? (onDay / checkInLogs.length) * 100 : 0;
+  const avgMinutes = checkInLogs.length
+    ? checkInLogs.reduce((s, l) => {
+        const d = new Date(l.createdAt);
+        return s + d.getHours() * 60 + d.getMinutes();
+      }, 0) / checkInLogs.length
+    : 0;
+  const avgClock = `${String(Math.floor(avgMinutes / 60)).padStart(2, "0")}:${String(Math.round(avgMinutes % 60)).padStart(2, "0")}`;
+
+  // Expected collections from today's departures
+  const collect = { on_arrival: 0, none: 0, company: 0, online: 0 };
+  let noAmount = 0;
+  departures.forEach((b) => {
+    const amt = netAmount(b);
+    if (!(Number(b.totalAmount) > 0)) noAmount += 1;
+    const key = b.paymentMethod === "company" ? "company" : b.paymentMethod === "online" ? "online" : b.paymentMethod === "on_arrival" ? "on_arrival" : "none";
+    collect[key] += amt;
+  });
+  const atDesk = collect.on_arrival + collect.none;
+
+  const card = { ...{}, padding: "0.9rem" };
+  const sectionTitle = (text, icon) => (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: "0.75rem", color: TOKENS.brassDark, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 700, marginBottom: 10 }}>
+      {icon && <Ico name={icon} size={14} />} {text}
+    </div>
+  );
+  const emptyBox = (text) => <div style={{ color: TOKENS.inkSoft, fontSize: "0.82rem", padding: "0.6rem 0" }}>{text}</div>;
+  const chip = (active, color = TOKENS.ink) => ({
+    ...ghostBtn,
+    flexShrink: 0,
+    whiteSpace: "nowrap",
+    minHeight: 40,
+    background: active ? color : "#fff",
+    color: active ? "#fff" : TOKENS.inkSoft,
+    borderColor: active ? color : TOKENS.paperDim,
+    fontWeight: active ? 600 : 400,
+  });
+
+  const bookingLine = (b, extra) => (
+    <div key={b.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "0.5rem 0", borderTop: `1px solid ${TOKENS.paperDim}` }}>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontWeight: 600, fontSize: "0.86rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {roomLabel(b.roomNumber)} · {guestName(b.guestId)}
+        </div>
+        <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>
+          {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)}
+        </div>
+      </div>
+      {extra}
+    </div>
+  );
+
+  const renderLog = (l) => {
+    const meta = AUDIT_ACTIONS[l.action] || { icon: "note", color: TOKENS.inkSoft, bg: TOKENS.paper };
+    const flagged = l.risk === "high" || l.risk === "warn";
+    return (
+      <div key={l.id} style={{ display: "flex", gap: 10, padding: "0.7rem 0.75rem", borderRadius: 12, marginBottom: 8, background: l.risk === "high" ? "#FDF1F0" : l.risk === "warn" ? "#FEF6EA" : "#fff", border: `1px solid ${l.risk === "high" ? "#E7BEBE" : l.risk === "warn" ? "#EFD3A8" : TOKENS.paperDim}` }}>
+        <span style={{ width: 36, height: 36, borderRadius: 11, background: meta.bg, color: meta.color, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+          <Ico name={meta.icon} size={17} />
+        </span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+            <span style={{ fontWeight: 700, fontSize: "0.88rem" }}>{l.action}</span>
+            {l.roomNumber && <SoftBadge small color={TOKENS.inkSoft} bg={TOKENS.paper}>Room {l.roomNumber}</SoftBadge>}
+            {flagged && (
+              <SoftBadge small icon="alert" color={l.risk === "high" ? TOKENS.oos : "#B5651D"} bg={l.risk === "high" ? TOKENS.oosBg : "#FBE7D2"}>
+                {l.risk === "high" ? "High risk" : "Review"}
+              </SoftBadge>
+            )}
+          </div>
+          {l.details && <div style={{ fontSize: "0.8rem", color: TOKENS.ink, marginTop: 3, wordBreak: "break-word" }}>{l.details}</div>}
+          <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft, marginTop: 3, display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+              <Ico name="user" size={11} /> {l.staffName}
+            </span>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+              <Ico name="clock" size={11} /> {whenLabel(l.createdAt)}
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderNote = (n) => (
+    <div key={n.id} style={{ borderRadius: 14, padding: "0.8rem 0.9rem", marginBottom: 10, background: n.resolved ? "#F4F1EA" : n.urgent ? "#FDF1F0" : "#fff", border: `1px solid ${n.urgent && !n.resolved ? "#E7BEBE" : TOKENS.paperDim}`, borderLeft: `5px solid ${n.resolved ? TOKENS.paperDim : n.urgent ? TOKENS.oos : n.pinned ? TOKENS.brass : TOKENS.paperDim}`, opacity: n.resolved ? 0.75 : 1 }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", marginBottom: 6 }}>
+        {n.pinned && <SoftBadge small icon="pin" color="#8A5A00" bg="#F8E9C8">Pinned</SoftBadge>}
+        {n.urgent && <SoftBadge small icon="alert" color={TOKENS.oos} bg={TOKENS.oosBg}>Urgent</SoftBadge>}
+        <SoftBadge small color="#2F5F8F" bg="#DCE9F5">{(SHIFTS.find((s) => s.key === n.shift) || SHIFTS[0]).label}</SoftBadge>
+        {n.resolved && <SoftBadge small icon="check" color={TOKENS.clean} bg={TOKENS.cleanBg}>Done</SoftBadge>}
+      </div>
+      <div style={{ fontSize: "0.92rem", whiteSpace: "pre-wrap", wordBreak: "break-word", textDecoration: n.resolved ? "line-through" : "none" }}>{n.body}</div>
+      <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft, margin: "6px 0 8px" }}>
+        {n.authorName ? `${n.authorName} · ` : ""}
+        {whenLabel(n.createdAt)}
+      </div>
+      <div className="md-scroll">
+        <button className="gx-btn md-btn" onClick={() => patchNote(n.id, { pinned: !n.pinned })} style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
+          <Ico name="pin" size={13} /> {n.pinned ? "Unpin" : "Pin"}
+        </button>
+        <button className="gx-btn md-btn" onClick={() => patchNote(n.id, { urgent: !n.urgent })} style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 5, flexShrink: 0, color: n.urgent ? TOKENS.inkSoft : TOKENS.oos }}>
+          <Ico name="alert" size={13} /> {n.urgent ? "Not urgent" : "Mark urgent"}
+        </button>
+        <button className="gx-btn md-btn" onClick={() => patchNote(n.id, { resolved: !n.resolved })} style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 5, flexShrink: 0, color: n.resolved ? TOKENS.inkSoft : TOKENS.clean }}>
+          <Ico name="check" size={13} /> {n.resolved ? "Reopen" : "Done"}
+        </button>
+        <button className="gx-btn md-btn" onClick={() => setConfirmDelete(n)} aria-label="Delete note" style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 5, flexShrink: 0, color: TOKENS.oos }}>
+          <Ico name="trash" size={13} /> Delete
+        </button>
+      </div>
+    </div>
+  );
+
+  const run = async (id, fn) => {
+    setBusyId(id);
+    try {
+      await fn();
+    } finally {
+      setBusyId(null);
+      if (hotelId) setTick((t) => t + 1);
+    }
+  };
+  const actBtn = (color, bg) => ({ ...ghostBtn, minHeight: 40, display: "inline-flex", alignItems: "center", gap: 5, flexShrink: 0, whiteSpace: "nowrap", color, background: bg || "#fff", borderColor: color, fontWeight: 600 });
+  const freeRooms = rooms.filter((r) => r.status === "vacant_clean" || r.status === "vacant_dirty");
+  const dirtyRooms = rooms.filter((r) => r.status === "vacant_dirty");
+  const oosRooms = rooms.filter((r) => r.status === "out_of_order");
+  const cleanRooms = rooms.filter((r) => r.status === "vacant_clean");
+  const inHouse = live.filter((b) => b.status === "checked_in");
+  const guestPhone = (id) => (guests.find((g) => g.id === id) || {}).phone || "";
+
+  const arrivalCard = (b) => {
+    const tags = guestTags(b.guestId);
+    const checkedIn = b.status === "checked_in" || b.status === "checked_out";
+    return (
+      <div key={b.id} style={{ borderTop: `1px solid ${TOKENS.paperDim}`, padding: "0.65rem 0" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontWeight: 600, fontSize: "0.88rem", display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              {guestName(b.guestId)}
+              {tags.includes("vip") && <SoftBadge small icon="star" color="#8A5A00" bg="#F8E9C8">VIP</SoftBadge>}
+              {tags.includes("blacklisted") && <SoftBadge small icon="ban" color={TOKENS.oos} bg={TOKENS.oosBg}>Blacklisted</SoftBadge>}
+            </div>
+            <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>
+              {roomLabel(b.roomNumber)} · {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)} · {b.persons || 1} guest{(b.persons || 1) === 1 ? "" : "s"}
+              {guestPhone(b.guestId) ? ` · ${guestPhone(b.guestId)}` : ""}
+            </div>
+          </div>
+          {checkedIn ? <SoftBadge small icon="check" color={TOKENS.clean} bg={TOKENS.cleanBg}>{b.status === "checked_out" ? "Out" : "In"}</SoftBadge> : <SoftBadge small color="#2F5F8F" bg="#DCE9F5">Pending</SoftBadge>}
+        </div>
+        {!checkedIn && (
+          <div className="md-scroll" style={{ marginTop: 8, alignItems: "center" }}>
+            {!b.roomNumber && (
+              <>
+                <select value={assigning[b.id] || ""} onChange={(e) => setAssigning({ ...assigning, [b.id]: e.target.value })} style={{ ...inputStyle, minHeight: 40, flexShrink: 0 }} aria-label="Room to assign">
+                  <option value="">Assign room…</option>
+                  {cleanRooms.map((r) => <option key={r.id} value={r.number}>Room {r.number}</option>)}
+                </select>
+                <button className="gx-btn" disabled={!assigning[b.id] || busyId === b.id} onClick={() => run(b.id, () => onAssignRoom(b.id, assigning[b.id]))} style={{ ...actBtn("#2F5F8F"), opacity: assigning[b.id] ? 1 : 0.5 }}>
+                  <Ico name="check" size={13} /> Assign
+                </button>
+              </>
+            )}
+            <button className="gx-btn" disabled={busyId === b.id || !b.roomNumber} onClick={() => run(b.id, () => onCheckIn(b.id))} style={{ ...actBtn(TOKENS.clean, TOKENS.cleanBg), opacity: b.roomNumber ? 1 : 0.5 }}>
+              <Ico name="login" size={13} /> {busyId === b.id ? "…" : "Check in"}
+            </button>
+            <button className="gx-btn" onClick={() => setConfirmCancel(b)} style={actBtn(TOKENS.oos)}>
+              <Ico name="ban" size={13} /> Cancel
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const stayCard = (b, late) => (
+    <div key={b.id} style={{ borderTop: `1px solid ${TOKENS.paperDim}`, padding: "0.65rem 0" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontWeight: 600, fontSize: "0.88rem" }}>{roomLabel(b.roomNumber)} · {guestName(b.guestId)}</div>
+          <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>
+            {fmtDate(b.checkIn)} → {fmtDate(b.checkOut)}
+            {Number(b.totalAmount) > 0 ? ` · ${fmtMoney(Math.round(netAmount(b)))}` : ""}
+            {b.paymentMethod ? ` · ${paymentMethodLabel(b.paymentMethod)}` : ""}
+          </div>
+        </div>
+        {late ? <SoftBadge small color={TOKENS.oos} bg={TOKENS.oosBg}>{Math.max(1, Math.round((new Date(today) - new Date(b.checkOut)) / 86400000))}d late</SoftBadge> : b.status === "checked_out" ? <SoftBadge small icon="check" color={TOKENS.clean} bg={TOKENS.cleanBg}>Out</SoftBadge> : null}
+      </div>
+      {b.status === "checked_in" && (
+        <div className="md-scroll" style={{ marginTop: 8 }}>
+          <button className="gx-btn" disabled={busyId === b.id} onClick={() => run(b.id, () => onCheckOut(b.id))} style={actBtn("#C9722B", "#FBE7D2")}>
+            <Ico name="logout" size={13} /> {busyId === b.id ? "…" : "Check out"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
+  const tabs = [
+    { key: "overview", label: "Overview", icon: "grid" },
+    { key: "audit", label: "Staff Audit", icon: "shield", badge: highRisk.length || null },
+    { key: "notes", label: "Shift Notes", icon: "note", badge: urgentOpen || null },
+    { key: "analytics", label: "Analytics", icon: "chart" },
+    ...(onNavigate ? [{ key: "manage", label: "Manage", icon: "grid" }] : []),
+  ];
+  const presets = [
+    { label: "Today", s: today, e: today },
+    { label: "Yesterday", s: addDaysISO(today, -1), e: addDaysISO(today, -1) },
+    { label: "7 days", s: addDaysISO(today, -6), e: today },
+    { label: "30 days", s: addDaysISO(today, -29), e: today },
+  ];
+
+  return (
+    <div>
+      <style>{GUESTS_CSS}</style>
+      <style>{MD_CSS}</style>
+
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+        <div>
+          <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.35rem", margin: 0 }}>Reception manager</h2>
+          <div style={{ fontSize: "0.75rem", color: TOKENS.inkSoft, marginTop: 2 }}>
+            {hotelId ? "Live from Supabase" : "Demo mode (no Supabase session)"}
+            {lastSync ? ` · updated ${lastSync.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}
+          </div>
+        </div>
+        <button className="gx-btn md-btn" onClick={() => setTick((t) => t + 1)} style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 6, background: "#fff" }}>
+          <Ico name="refresh" size={14} /> Refresh
+        </button>
+      </div>
+
+      {/* Filters */}
+      <div className="md-glass" style={{ padding: "0.7rem", marginBottom: 10 }}>
+        <div className="md-scroll" style={{ marginBottom: 8 }}>
+          {presets.map((p) => (
+            <button key={p.label} className="gx-btn" onClick={() => { setRangeStart(p.s); setRangeEnd(p.e); }} style={chip(rangeStart === p.s && rangeEnd === p.e)}>
+              {p.label}
+            </button>
+          ))}
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+          <label style={{ fontSize: "0.7rem", color: TOKENS.inkSoft }}>
+            From
+            <input type="date" value={rangeStart} max={rangeEnd} onChange={(e) => e.target.value && setRangeStart(e.target.value)} style={{ ...inputStyle, width: "100%", boxSizing: "border-box", minHeight: 44, marginTop: 3 }} />
+          </label>
+          <label style={{ fontSize: "0.7rem", color: TOKENS.inkSoft }}>
+            To
+            <input type="date" value={rangeEnd} min={rangeStart} onChange={(e) => e.target.value && setRangeEnd(e.target.value)} style={{ ...inputStyle, width: "100%", boxSizing: "border-box", minHeight: 44, marginTop: 3 }} />
+          </label>
+        </div>
+        <div className="md-scroll">
+          {SHIFTS.map((s) => (
+            <button key={s.key} className="gx-btn" onClick={() => setShift(s.key)} style={chip(shift === s.key, "#2F5F8F")}>
+              {s.label}
+              {s.sub && <span style={{ fontSize: "0.66rem", opacity: 0.8, marginLeft: 5 }}>{s.sub}</span>}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {dbError && <div style={{ color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 10, padding: "0.65rem 0.8rem", fontSize: "0.84rem", marginBottom: 10 }}>{dbError}</div>}
+
+      {/* Tabs */}
+      <div className="md-tabbar" style={{ background: TOKENS.paper, paddingBottom: 8, paddingTop: 2 }}>
+        <div style={{ display: "grid", gridTemplateColumns: `repeat(${tabs.length}, minmax(0, 1fr))`, gap: 4, background: "#fff", border: `1px solid ${TOKENS.paperDim}`, borderRadius: 14, padding: 4 }} role="tablist">
+          {tabs.map((t) => {
+            const act = tab === t.key;
+            return (
+              <button key={t.key} role="tab" aria-selected={act} className="gx-btn" onClick={() => setTab(t.key)} style={{ position: "relative", minHeight: 50, border: "none", borderRadius: 10, cursor: "pointer", fontFamily: "inherit", background: act ? TOKENS.ink : "transparent", color: act ? TOKENS.paper : TOKENS.inkSoft, fontWeight: act ? 700 : 500, fontSize: mobile ? "0.68rem" : "0.86rem", display: "flex", flexDirection: mobile ? "column" : "row", alignItems: "center", justifyContent: "center", gap: mobile ? 2 : 7, padding: "0.3rem 0.2rem" }}>
+                <Ico name={t.icon} size={mobile ? 16 : 15} />
+                {t.label}
+                {t.badge ? <span style={{ position: "absolute", top: 3, right: mobile ? 6 : 10, background: TOKENS.oos, color: "#fff", borderRadius: 999, fontSize: "0.62rem", minWidth: 16, height: 16, display: "inline-flex", alignItems: "center", justifyContent: "center", padding: "0 4px", fontWeight: 700 }}>{t.badge}</span> : null}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {tab === "overview" && (
+        <div>
+          <div className="md-kpis" style={{ marginBottom: 14 }}>
+            {kpis.map((k) => (
+              <div key={k.key} className="md-glass" style={{ padding: "0.8rem 0.9rem", display: "flex", gap: 10, alignItems: "center" }}>
+                <span style={{ width: 40, height: 40, borderRadius: 12, background: k.bg, color: k.color, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <Ico name={k.icon} size={19} />
+                </span>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: "1.55rem", fontWeight: 700, fontFamily: "Fraunces, serif", lineHeight: 1.1 }}>{k.value}</div>
+                  <div style={{ fontSize: "0.74rem", color: TOKENS.inkSoft }}>{k.label}</div>
+                  <div style={{ fontSize: "0.7rem", color: k.subColor || TOKENS.inkSoft, fontWeight: k.subColor ? 600 : 400 }}>{k.sub}</div>
+                  {k.bar !== undefined && (
+                    <div style={{ height: 5, background: TOKENS.paperDim, borderRadius: 999, marginTop: 5, overflow: "hidden" }}>
+                      <div style={{ width: `${Math.round(Math.min(1, k.bar) * 100)}%`, height: "100%", background: k.color, transition: "width .5s ease" }} />
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="md-cols" style={{ marginBottom: 12 }}>
+            <div className="md-glass" style={card}>
+              {sectionTitle(`Today's arrivals (${arrDone}/${arrivals.length})`, "login")}
+              {arrivals.length === 0 ? emptyBox("No arrivals today.") : arrivals.map(arrivalCard)}
+            </div>
+            <div className="md-glass" style={card}>
+              {sectionTitle(`Departures & overdue (${depDone}/${departures.length})`, "logout")}
+              {departures.length + overdue.length === 0 ? emptyBox("No departures today.") : <>{overdue.map((b) => stayCard(b, true))}{departures.map((b) => stayCard(b, false))}</>}
+            </div>
+          </div>
+
+          <div className="md-cols" style={{ marginBottom: 12 }}>
+            <div className="md-glass" style={card}>
+              {sectionTitle("Rooms snapshot", "bed")}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
+                {[
+                  { label: "Occupied", n: occupied, color: TOKENS.occupied, bg: TOKENS.occupiedBg },
+                  { label: "Clean & vacant", n: cleanRooms.length, color: TOKENS.clean, bg: TOKENS.cleanBg },
+                  { label: "Needs cleaning", n: dirtyRooms.length, color: TOKENS.dirty, bg: TOKENS.dirtyBg },
+                  { label: "Out of order", n: oosRooms.length, color: TOKENS.oos, bg: TOKENS.oosBg },
+                ].map((c) => (
+                  <div key={c.label} style={{ background: c.bg, borderRadius: 12, padding: "0.55rem 0.7rem" }}>
+                    <div style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", fontWeight: 700, color: c.color }}>{c.n}</div>
+                    <div style={{ fontSize: "0.72rem", color: c.color, fontWeight: 600 }}>{c.label}</div>
+                  </div>
+                ))}
+              </div>
+              {dirtyRooms.length > 0 && (
+                <div>
+                  <div style={{ fontSize: "0.78rem", fontWeight: 700, color: TOKENS.dirty, marginBottom: 4 }}>Rooms waiting for housekeeping</div>
+                  {dirtyRooms.slice(0, 8).map((r) => (
+                    <div key={r.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: `1px solid ${TOKENS.paperDim}`, padding: "0.4rem 0" }}>
+                      <span style={{ fontWeight: 600, fontSize: "0.86rem" }}>Room {r.number}</span>
+                      <button className="gx-btn" disabled={busyId === `r${r.id}`} onClick={() => run(`r${r.id}`, () => onMarkClean(r.number))} style={actBtn(TOKENS.clean, TOKENS.cleanBg)}>
+                        <Ico name="check" size={13} /> Mark clean
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="md-glass" style={card}>
+              {sectionTitle(`In-house guests (${inHouse.length})`, "user")}
+              {inHouse.length === 0 ? emptyBox("No guests in-house.") : inHouse.slice(0, 12).map((b) => stayCard(b, b.checkOut < today))}
+              {inHouse.length > 12 && <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft, paddingTop: 6 }}>+ {inHouse.length - 12} more — see Rooms.</div>}
+            </div>
+          </div>
+
+          <div className="md-cols">
+            <div className="md-glass" style={card}>
+              {sectionTitle(`Needs attention`, "alert")}
+              {overdue.length === 0 && unassigned.length === 0 && vipPending.length === 0 && blacklistedPending.length === 0 && emptyBox("Nothing needs attention right now.")}
+              {overdue.length > 0 && (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: "0.78rem", fontWeight: 700, color: TOKENS.oos }}>Overdue check-outs ({overdue.length})</div>
+                  {overdue.slice(0, 5).map((b) => bookingLine(b, <SoftBadge small color={TOKENS.oos} bg={TOKENS.oosBg}>{Math.max(1, Math.round((new Date(today) - new Date(b.checkOut)) / 86400000))}d late</SoftBadge>))}
+                </div>
+              )}
+              {unassigned.length > 0 && (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: "0.78rem", fontWeight: 700, color: "#B5651D" }}>No room assigned ({unassigned.length})</div>
+                  {unassigned.slice(0, 5).map((b) => bookingLine(b, <SoftBadge small color="#B5651D" bg="#FBE7D2">{b.checkIn <= today ? "Arriving" : "Upcoming"}</SoftBadge>))}
+                </div>
+              )}
+              {blacklistedPending.length > 0 && (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: "0.78rem", fontWeight: 700, color: TOKENS.oos }}>Blacklisted guest arriving</div>
+                  {blacklistedPending.map((b) => bookingLine(b, <SoftBadge small icon="ban" color={TOKENS.oos} bg={TOKENS.oosBg}>Blacklisted</SoftBadge>))}
+                </div>
+              )}
+              {vipPending.length > 0 && (
+                <div>
+                  <div style={{ fontSize: "0.78rem", fontWeight: 700, color: "#8A5A00" }}>VIP arrivals pending</div>
+                  {vipPending.map((b) => bookingLine(b, <SoftBadge small icon="star" color="#8A5A00" bg="#F8E9C8">VIP</SoftBadge>))}
+                </div>
+              )}
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div className="md-glass" style={card}>
+                {sectionTitle("Urgent & pinned notes", "note")}
+                {openNotes.filter((n) => n.urgent || n.pinned).length === 0
+                  ? emptyBox("No urgent or pinned notes.")
+                  : openNotes.filter((n) => n.urgent || n.pinned).slice(0, 3).map(renderNote)}
+                <button className="gx-btn md-btn" onClick={() => setTab("notes")} style={{ ...ghostBtn, width: "100%", background: "#fff" }}>
+                  Open shift notes
+                </button>
+              </div>
+              <div className="md-glass" style={card}>
+                {sectionTitle("Latest risky actions", "shield")}
+                {logsInShift.filter((l) => l.risk !== "normal").length === 0
+                  ? emptyBox("No flagged actions in this period.")
+                  : logsInShift.filter((l) => l.risk !== "normal").slice(0, 3).map(renderLog)}
+                <button className="gx-btn md-btn" onClick={() => setTab("audit")} style={{ ...ghostBtn, width: "100%", background: "#fff" }}>
+                  Open staff audit
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {tab === "audit" && (
+        <div>
+          <div className="md-glass" style={{ padding: "0.7rem", marginBottom: 10 }}>
+            <div className="md-scroll" style={{ marginBottom: 8 }}>
+              {AUDIT_FILTERS.map((f) => (
+                <button key={f.key} className="gx-btn" onClick={() => setAuditFilter(f.key)} style={chip(auditFilter === f.key, f.key === "risk" ? TOKENS.oos : TOKENS.ink)}>
+                  {f.label}
+                </button>
+              ))}
+            </div>
+            <select value={staffFilter} onChange={(e) => setStaffFilter(e.target.value)} style={{ ...inputStyle, width: "100%", minHeight: 44 }} aria-label="Staff filter">
+              <option value="all">All staff ({logsInShift.length} actions)</option>
+              {staffNames.map((n) => (
+                <option key={n} value={n}>
+                  {n} ({logCountByStaff[n]})
+                </option>
+              ))}
+            </select>
+          </div>
+          {loading ? (
+            <BookingsSkeleton mobile />
+          ) : filteredLogs.length === 0 ? (
+            <div className="md-glass" style={{ ...card, textAlign: "center", padding: "2rem 1rem", color: TOKENS.inkSoft }}>
+              <div style={{ display: "inline-flex", padding: 14, borderRadius: "50%", background: TOKENS.paper, marginBottom: 8 }}>
+                <Ico name="shield" size={24} color={TOKENS.brass} />
+              </div>
+              <div style={{ fontWeight: 600, color: TOKENS.ink, marginBottom: 4 }}>No activity found</div>
+              <div style={{ fontSize: "0.82rem" }}>Actions are recorded from the moment this update is live. Try a wider date range or another shift.</div>
+            </div>
+          ) : (
+            <div>{filteredLogs.slice(0, 200).map(renderLog)}</div>
+          )}
+        </div>
+      )}
+
+      {tab === "notes" && (
+        <div>
+          <div className="md-glass" style={{ ...card, marginBottom: 12 }}>
+            {sectionTitle("New handover note", "plus")}
+            <textarea
+              value={draft.body}
+              onChange={(e) => setDraft({ ...draft, body: e.target.value })}
+              rows={3}
+              placeholder="e.g. Room 204 owes 500 EGP upon checkout"
+              style={{ ...inputStyle, width: "100%", boxSizing: "border-box", fontSize: "1rem", resize: "vertical", marginBottom: 8 }}
+            />
+            <div className="md-scroll" style={{ marginBottom: 8 }}>
+              <span style={{ alignSelf: "center", fontSize: "0.72rem", color: TOKENS.inkSoft, flexShrink: 0 }}>For:</span>
+              {SHIFTS.map((s) => (
+                <button key={s.key} className="gx-btn" onClick={() => setDraft({ ...draft, shift: s.key })} style={chip(draft.shift === s.key, "#2F5F8F")}>
+                  {s.key === "all" ? "Any shift" : s.label}
+                </button>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button className="gx-btn md-btn" onClick={() => setDraft({ ...draft, urgent: !draft.urgent })} aria-pressed={draft.urgent} style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 6, background: draft.urgent ? TOKENS.oosBg : "#fff", color: draft.urgent ? TOKENS.oos : TOKENS.inkSoft, borderColor: draft.urgent ? TOKENS.oos : TOKENS.paperDim, fontWeight: draft.urgent ? 700 : 400 }}>
+                <Ico name="alert" size={14} /> Urgent
+              </button>
+              <button className="gx-btn md-btn" onClick={() => setDraft({ ...draft, pinned: !draft.pinned })} aria-pressed={draft.pinned} style={{ ...ghostBtn, display: "inline-flex", alignItems: "center", gap: 6, background: draft.pinned ? "#F8E9C8" : "#fff", color: draft.pinned ? "#8A5A00" : TOKENS.inkSoft, borderColor: draft.pinned ? "#8A5A00" : TOKENS.paperDim, fontWeight: draft.pinned ? 700 : 400 }}>
+                <Ico name="pin" size={14} /> Pin
+              </button>
+              <button className="gx-btn md-btn" onClick={postNote} disabled={noteBusy} style={{ ...primaryBtn, flex: 1, minWidth: 130, display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6, opacity: noteBusy ? 0.6 : 1 }}>
+                <Ico name="check" size={15} /> {noteBusy ? "Posting…" : "Post note"}
+              </button>
+            </div>
+            {noteError && <div style={{ color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.7rem", fontSize: "0.8rem", marginTop: 8 }}>{noteError}</div>}
+            {!hotelId && <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft, marginTop: 8 }}>Demo mode: notes live in this page only and disappear on reload.</div>}
+          </div>
+
+          {openNotes.length === 0 ? <div className="md-glass" style={{ ...card, textAlign: "center", color: TOKENS.inkSoft, padding: "1.6rem" }}>No open notes for this shift.</div> : openNotes.map(renderNote)}
+
+          {doneNotes.length > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <button className="gx-btn md-btn" onClick={() => setShowResolved(!showResolved)} style={{ ...ghostBtn, width: "100%", background: "#fff", marginBottom: 8 }}>
+                {showResolved ? "Hide" : "Show"} completed ({doneNotes.length})
+              </button>
+              {showResolved && doneNotes.map(renderNote)}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === "analytics" && (
+        <div>
+          <div className="md-cols" style={{ marginBottom: 12 }}>
+            <div className="md-glass" style={card}>
+              {sectionTitle("Check-in performance", "login")}
+              {checkInLogs.length === 0 ? (
+                emptyBox("No check-ins logged in this period yet. Check-ins are recorded from the moment this update is live.")
+              ) : (
+                <>
+                  <Gauge value={onDayPct} color={onDayPct >= 80 ? TOKENS.clean : onDayPct >= 50 ? TOKENS.dirty : TOKENS.oos} label="Checked in on arrival day" sub={`${onDay} of ${checkInLogs.length} check-ins · avg time ${avgClock}`} />
+                  <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginTop: 8, textAlign: "center" }}>
+                    The app records when check-in is done, not how long it took, so true processing time can't be measured.
+                  </div>
+                </>
+              )}
+            </div>
+            <div className="md-glass" style={card}>
+              {sectionTitle("Staff activity", "users")}
+              {staffNames.length === 0 ? emptyBox("No staff actions in this period.") : staffNames.map((n) => <BarRow key={n} label={n} value={logCountByStaff[n]} max={Math.max(...Object.values(logCountByStaff))} color="#2F5F8F" right={`${logCountByStaff[n]} actions`} />)}
+            </div>
+          </div>
+
+          <div className="md-cols" style={{ marginBottom: 12 }}>
+            <div className="md-glass" style={card}>
+              {sectionTitle(`Booking channels · ${fmtDate(rangeStart)}–${fmtDate(rangeEnd)}`, "chart")}
+              {channelStats.length === 0 ? emptyBox("No bookings in this period.") : channelStats.map((c) => <BarRow key={c.key} label={c.label} value={c.count} max={channelMax} color={c.color} right={`${c.count} · ${fmtMoney(Math.round(c.revenue))}`} />)}
+            </div>
+            <div className="md-glass" style={card}>
+              {sectionTitle("Meal plan ratio", "chart")}
+              {mealTotal === 0 ? (
+                emptyBox("No bookings in this period.")
+              ) : (
+                <>
+                  <div style={{ display: "flex", height: 16, borderRadius: 999, overflow: "hidden", marginBottom: 10 }}>
+                    {mealEntries.map(([p, n], i) => (
+                      <div key={p} title={`${p}: ${n}`} style={{ width: `${(n / mealTotal) * 100}%`, background: MEAL_COLORS[i % MEAL_COLORS.length] }} />
+                    ))}
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "6px 12px" }}>
+                    {mealEntries.map(([p, n], i) => (
+                      <span key={p} style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: "0.78rem" }}>
+                        <span style={{ width: 9, height: 9, borderRadius: "50%", background: MEAL_COLORS[i % MEAL_COLORS.length] }} />
+                        {p} <strong>{Math.round((n / mealTotal) * 100)}%</strong> <span style={{ color: TOKENS.inkSoft }}>({n})</span>
+                      </span>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          <div className="md-glass" style={card}>
+            {sectionTitle("Expected collections · today's departures", "cash")}
+            {departures.length === 0 ? (
+              emptyBox("No departures today.")
+            ) : (
+              <>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: 8, marginBottom: 10 }}>
+                  {[
+                    { label: "To collect at desk", value: atDesk, color: TOKENS.oos, bg: TOKENS.oosBg },
+                    { label: "Bill to company", value: collect.company, color: "#B5651D", bg: "#FBE7D2" },
+                    { label: "Paid online", value: collect.online, color: TOKENS.clean, bg: TOKENS.cleanBg },
+                  ].map((c) => (
+                    <div key={c.label} style={{ background: c.bg, borderRadius: 12, padding: "0.6rem 0.75rem" }}>
+                      <div style={{ fontSize: "0.7rem", color: c.color, fontWeight: 600 }}>{c.label}</div>
+                      <div style={{ fontFamily: "Fraunces, serif", fontSize: "1.25rem", fontWeight: 700 }}>{fmtMoney(Math.round(c.value))}</div>
+                    </div>
+                  ))}
+                </div>
+                {departures.map((b) =>
+                  bookingLine(
+                    b,
+                    <div style={{ textAlign: "right", flexShrink: 0 }}>
+                      <div style={{ fontWeight: 700, fontSize: "0.85rem" }}>{Number(b.totalAmount) > 0 ? fmtMoney(Math.round(netAmount(b))) : "No amount"}</div>
+                      <div style={{ fontSize: "0.68rem", color: TOKENS.inkSoft }}>{b.paymentMethod ? paymentMethodLabel(b.paymentMethod) : "No method"} · {b.status === "checked_out" ? "out" : "in-house"}</div>
+                    </div>
+                  )
+                )}
+                <div style={{ fontSize: "0.7rem", color: TOKENS.inkSoft, marginTop: 8 }}>
+                  The app doesn't record payments received, so "to collect" is the booking total (after discount) for guests not paying online or via company.
+                  {noAmount > 0 ? ` ${noAmount} departure${noAmount === 1 ? " has" : "s have"} no total entered.` : ""}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {tab === "manage" && onNavigate && (
+        <div className="md-kpis">
+          {[
+            { id: "todayReport", label: "Today report", sub: "Arrivals, departures, kitchen stats", icon: "clock" },
+            { id: "roomActivity", label: "Room activity", sub: "Per-room history and revenue", icon: "bed" },
+            { id: "revenue", label: "Revenue", sub: "Money, tickets and bookings by period", icon: "cash" },
+            { id: "ticketRecords", label: "Ticket records", sub: "Sold tickets", icon: "note" },
+            { id: "pricing", label: "Room pricing", sub: "Rates and meal plans", icon: "edit" },
+            { id: "companies", label: "Companies", sub: "Add companies to Booking type", icon: "note" },
+            { id: "rooms", label: "Rooms", sub: "Add rooms and choose their options", icon: "bed" },
+            ...(role === "manager" ? [{ id: "users", label: "Users", sub: "Staff accounts and roles", icon: "users" }] : []),
+          ].map((m) => (
+            <button key={m.id} className="gx-btn md-glass" onClick={() => onNavigate(m.id)} style={{ textAlign: "left", cursor: "pointer", padding: "0.9rem", display: "flex", gap: 10, alignItems: "center", fontFamily: "inherit", color: TOKENS.ink, minHeight: 64 }}>
+              <span style={{ width: 40, height: 40, borderRadius: 12, background: TOKENS.paper, color: TOKENS.brassDark, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                <Ico name={m.icon} size={19} />
+              </span>
+              <span>
+                <div style={{ fontWeight: 700, fontSize: "0.95rem" }}>{m.label}</div>
+                <div style={{ fontSize: "0.74rem", color: TOKENS.inkSoft }}>{m.sub}</div>
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {confirmCancel && (
+        <ConfirmModal
+          title="Cancel this booking?"
+          message={`${guestName(confirmCancel.guestId)} · ${fmtDate(confirmCancel.checkIn)} → ${fmtDate(confirmCancel.checkOut)}. This is logged in the staff audit.`}
+          confirmLabel="Cancel booking"
+          cancelLabel="Keep it"
+          danger
+          onConfirm={() => {
+            const id = confirmCancel.id;
+            setConfirmCancel(null);
+            run(id, () => onCancel(id));
+          }}
+          onClose={() => setConfirmCancel(null)}
+        />
+      )}
+
+      {confirmDelete && (
+        <ConfirmModal
+          title="Delete this note?"
+          message="It will be removed for everyone. Use 'Done' instead if you only want to hide it."
+          confirmLabel="Delete note"
+          cancelLabel="Keep it"
+          danger
+          onConfirm={() => {
+            deleteNote(confirmDelete.id);
+            setConfirmDelete(null);
+          }}
+          onClose={() => setConfirmDelete(null)}
+        />
       )}
     </div>
   );
@@ -7629,6 +8615,150 @@ function RoomPricingTab({ roomRates, mealPlanRates, onSave, onSaveMealPlans }) {
       <button onClick={submit} disabled={!dirty} style={{ ...primaryBtn, marginTop: 12 }}>
         Save prices
       </button>
+    </div>
+  );
+}
+
+
+// ───────────────────────── Companies (extra Booking types) ─────────────────────────
+function CompaniesTab({ companies, onAdd, onDelete }) {
+  const [name, setName] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    const msg = await onAdd(name);
+    setBusy(false);
+    setErr(msg || "");
+    if (!msg) setName("");
+  };
+  return (
+    <div>
+      <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", marginBottom: "0.5rem" }}>Companies</h2>
+      <div style={{ fontSize: "0.85rem", color: TOKENS.inkSoft, marginBottom: "1rem" }}>
+        Companies you add here appear in the <b>Booking type</b> list (new booking, edit booking, and the booking source filters).
+      </div>
+      <form onSubmit={submit} style={{ ...cardStyle, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Company name"
+          style={{ ...inputStyle, flex: 1, minWidth: 200 }}
+        />
+        <button type="submit" disabled={busy || !name.trim()} style={primaryBtn}>
+          {busy ? "Adding…" : "Add company"}
+        </button>
+      </form>
+      {err && (
+        <div style={{ fontSize: "0.8rem", color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginTop: 8 }}>{err}</div>
+      )}
+      <div style={{ ...cardStyle, marginTop: 12 }}>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>Booking types</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {BOOKING_TYPES.map((t) => (
+            <div key={t.key} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ width: 12, height: 12, borderRadius: "50%", background: t.color, flexShrink: 0 }} />
+              <span style={{ fontWeight: 500, flex: 1 }}>{t.label}</span>
+              {t.isCompany ? (
+                <button
+                  onClick={() => {
+                    if (window.confirm(`Remove "${t.label}"? Existing bookings with it will show as Others.`)) onDelete(t.key);
+                  }}
+                  style={{ ...ghostBtn, padding: "0.25rem 0.6rem", color: TOKENS.oos }}
+                >
+                  Remove
+                </button>
+              ) : (
+                <span style={{ fontSize: "0.72rem", color: TOKENS.inkSoft }}>Built-in</span>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ───────────────────────── Add rooms ─────────────────────────
+function RoomsManageTab({ rooms, bookings, roomRates, onAddRoom }) {
+  const [form, setForm] = useState({ number: "", floor: "1", type: ROOM_TYPES[0], status: "vacant_clean", notes: "" });
+  const [err, setErr] = useState("");
+  const [ok, setOk] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    const msg = await onAddRoom(form);
+    setBusy(false);
+    setErr(msg || "");
+    if (!msg) {
+      setOk(`Room ${form.number.trim()} added.`);
+      setTimeout(() => setOk(""), 2500);
+      setForm({ ...form, number: "", notes: "" });
+    } else setOk("");
+  };
+  const label = { fontSize: "0.7rem", color: TOKENS.inkSoft, marginBottom: 4 };
+  const byFloor = {};
+  rooms.forEach((r) => { (byFloor[r.floor] = byFloor[r.floor] || []).push(r); });
+  return (
+    <div>
+      <h2 style={{ fontFamily: "Fraunces, serif", fontSize: "1.3rem", marginBottom: "0.5rem" }}>Rooms</h2>
+      <div style={{ fontSize: "0.85rem", color: TOKENS.inkSoft, marginBottom: "1rem" }}>
+        Add a new room and choose its options. The price follows the room category set in Room pricing.
+      </div>
+      <form onSubmit={submit} style={cardStyle}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10 }}>
+          <div>
+            <div style={label}>Room number</div>
+            <input value={form.number} onChange={(e) => setForm({ ...form, number: e.target.value })} placeholder="e.g. 507" style={{ ...inputStyle, width: "100%" }} />
+          </div>
+          <div>
+            <div style={label}>Floor</div>
+            <input type="number" min="0" value={form.floor} onChange={(e) => setForm({ ...form, floor: e.target.value })} style={{ ...inputStyle, width: "100%" }} />
+          </div>
+          <div>
+            <div style={label}>Category</div>
+            <select value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })} style={{ ...inputStyle, width: "100%" }}>
+              {ROOM_TYPES.map((t) => (
+                <option key={t} value={t}>{t} · {fmtMoney(roomRates[t] || 0)}/person/night</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <div style={label}>Initial status</div>
+            <select value={form.status} onChange={(e) => setForm({ ...form, status: e.target.value })} style={{ ...inputStyle, width: "100%" }}>
+              {Object.entries(STATUS_META).filter(([k]) => k !== "occupied").map(([k, m]) => (
+                <option key={k} value={k}>{m.label}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <div style={{ marginTop: 10 }}>
+          <div style={label}>Notes (optional)</div>
+          <input value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} placeholder="e.g. sea view, balcony" style={{ ...inputStyle, width: "100%" }} />
+        </div>
+        <button type="submit" disabled={busy || !form.number.trim() || form.floor === ""} style={{ ...primaryBtn, marginTop: 12 }}>
+          {busy ? "Adding…" : "Add room"}
+        </button>
+      </form>
+      {err && <div style={{ fontSize: "0.8rem", color: TOKENS.oos, background: TOKENS.oosBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginTop: 8 }}>{err}</div>}
+      {ok && <div style={{ fontSize: "0.8rem", color: TOKENS.clean, background: TOKENS.cleanBg, borderRadius: 8, padding: "0.5rem 0.7rem", marginTop: 8 }}>{ok}</div>}
+      <div style={{ ...cardStyle, marginTop: 12 }}>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>Current rooms ({rooms.length})</div>
+        {Object.keys(byFloor).sort((a, b) => a - b).map((f) => (
+          <div key={f} style={{ marginBottom: 8 }}>
+            <div style={{ fontSize: "0.72rem", color: TOKENS.inkSoft, marginBottom: 4 }}>{floorLabel(f)}</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {byFloor[f].map((r) => (
+                <span key={r.number} title={r.type} style={{ fontSize: "0.78rem", background: TOKENS.paper, border: `1px solid ${TOKENS.paperDim}`, borderRadius: 6, padding: "0.2rem 0.5rem" }}>
+                  {r.number} <span style={{ color: TOKENS.inkSoft }}>· {r.type}</span>
+                </span>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
